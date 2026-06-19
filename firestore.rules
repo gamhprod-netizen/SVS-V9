@@ -1,0 +1,21 @@
+﻿rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Version de demarrage: l'application utilise un document central unique.
+    // Tous les utilisateurs authentifies par Firebase Auth peuvent lire/ecrire.
+    // Activez Firebase Authentication > Anonymous pour que l'app se connecte
+    // automatiquement. Passez ensuite a firestore.rules.roles-strict.example
+    // lorsque vous aurez cree de vrais comptes et des roles serveur.
+    match /chorale/data/documents/main {
+      allow read, write: if signedIn();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
