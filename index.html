@@ -1,15 +1,15 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="fr">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-  <title>Chorale — Carnet de Gestion</title>
-  <meta name="description" content="Système ERP de gestion de chorale : membres, présences, discipline, finance, suggestions. Données synchronisées en ligne avec repli local.">
+  <title>SVS-EEI</title>
+  <meta name="description" content="Système ERP de gestion de chorale : membres, présences, discipline, finance, suggestions. Données enregistrées localement sur l'appareil.">
 
   <meta name="theme-color" content="#1A4F8A">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Chorale">
+  <meta name="apple-mobile-web-app-title" content="SVS-EEI">
 
   <link rel="manifest" href="manifest.json">
   <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
@@ -19,9 +19,15 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <script defer src="https://www.gstatic.com/firebasejs/10.12.5/firebase-app-compat.js"></script>
-  <script defer src="https://www.gstatic.com/firebasejs/10.12.5/firebase-auth-compat.js"></script>
-  <script defer src="https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore-compat.js"></script>
+
+  <!-- ═══════════════════════════════════════════════════════════════
+       FIREBASE CONFIGURATION (chargée depuis un fichier séparé)
+       Ne jamais déplacer ni supprimer cette ligne lors des mises à
+       jour de l'application. Le fichier firebase-config.js contient
+       toute la configuration Firebase du projet et ne doit pas être
+       écrasé par les mises à jour de l'application principale.
+       ═══════════════════════════════════════════════════════════════ -->
+  <script type="module" src="firebase-config.js"></script>
 
   <style>
 /* ════════════════════════════════════════════════════════════════
@@ -724,6 +730,37 @@ const SEED_DATA = {
   // ── SANCTIONS ──
   sanctions: [],
 
+  // ── DEMANDES DE MODIFICATION (7.6) ──
+  // Propositions de modification de fiche soumises par un choriste, en attente
+  // de validation par l'Admin. Ne touche jamais directement la fiche membre.
+  // { id, membreId, champs: {champ: nouvelleValeur}, dateDemande, statut: 'En attente'|'Validée'|'Refusée', dateTraitement, motifRefus }
+  demandesModification: [],
+
+  // ── COMPTES CHORISTES INDIVIDUELS (2) ──
+  // Clé = matricule = id du membre. { matricule, motDePasseHash, doitChangerMotDePasse,
+  //   dateCreation, dernieresConnexions: [iso...], statutCompte: 'Actif'|'Désactivé' }
+  comptesChoristes: {},
+
+  // ── GESTION DES TOGES (module Discipline) ──
+  // Types extensibles (par défaut : Verte, Bleue, Marron).
+  typesToges: ['Toge Verte', 'Toge Bleue', 'Toge Marron'],
+  // Inventaire : { id, type, code, etat: 'Disponible'|'Utilisée'|'Usée'|'Déchirée'|'En réparation'|'Hors service',
+  //   attribueA: membreId|null, dateAttribution, observations, historique:[{date, action, par, details}] }
+  toges: [],
+
+  // ── INSTRUMENTISTES (sous-module Musique) ──
+  // Fiche : { id, nom, instrumentPrincipal, instrumentsSecondaires:[], niveauMusical, dateEntree, observations }
+  instrumentistes: [],
+  // Répétition instrumentale : { id, date, responsable, presents:[nom], absents:[nom], retards:[nom],
+  //   chantsTravailles:[texte], observationsTechniques, difficultes, notesTechniques, commentaires,
+  //   axesAmelioration, ressourcesAudio:[{label, url}] }
+  repetitionsInstrumentales: [],
+
+  // ── ARCHIVES DES ANCIENS CHORISTES (Admin uniquement) ──
+  // { id, nom, prenom, sexe, voix, photo, dateEntree, dateDepart, motifDepart,
+  //   services:[], fonctions:[], anneesService, temoignage, galerie:[{type,label,url}] }
+  archives: [],
+
   // ── ACTIVITÉS ──
   activites: [],
 
@@ -797,9 +834,55 @@ const SEED_DATA = {
 // ════════════════════════════════════════════════════════════════
 
 const Utils = {
+  // Hachage du mot de passe d'un compte individuel (2 — comptes choristes).
+  // Utilise SHA-256 (Web Crypto) quand disponible ; repli simple sinon afin
+  // de ne jamais bloquer la connexion (ex. contexte non sécurisé).
+  async hashPassword(pw) {
+    try {
+      if (window.crypto && window.crypto.subtle) {
+        const enc = new TextEncoder().encode(String(pw));
+        const buf = await window.crypto.subtle.digest('SHA-256', enc);
+        return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+      }
+    } catch (e) { /* repli ci-dessous */ }
+    let hash = 0;
+    const s = String(pw);
+    for (let i = 0; i < s.length; i++) { hash = ((hash << 5) - hash + s.charCodeAt(i)) | 0; }
+    return 'fb_' + Math.abs(hash).toString(16) + '_' + s.length;
+  },
+
+  // Export générique CSV (compatible Excel — BOM UTF-8 + séparateur ;)
+  // utilisable par tous les départements pour exporter leurs données.
+  exportCSV(filename, headers, rows) {
+    const esc = (v) => {
+      const s = (v === null || v === undefined) ? '' : String(v);
+      return '"' + s.replace(/"/g, '""') + '"';
+    };
+    const lines = [headers.map(esc).join(';')];
+    rows.forEach(row => lines.push(row.map(esc).join(';')));
+    const csv = '\uFEFF' + lines.join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename.endsWith('.csv') ? filename : filename + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    this.toast('Export Excel téléchargé');
+  },
+
   MONTHS: ['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'],
   STATUTS_PRESENCE: ['Présent','Retard justifié','Retard non justifié','Absence justifiée','Absence non justifiée','Voyage'],
   PUPITRES: ['Soprano','Alto','Ténor','Basse','Baryton','Mezzo-Soprano','Non défini'],
+  FONCTIONS: [
+    'Président(e)', 'Secrétaire Principal', 'Directeur de Chœur Principal', 'Directeur de Chœur Adjoint(e)',
+    'Trésorier(e) Principal(e)', 'Trésorier(e) Adjoint(e)', 'Chargé(e) de Discipline Principal(e)',
+    'Chargé(e) de Discipline Adjoint(e)', 'Responsable Soprano', 'Responsable Soprano Adjoint(e)',
+    'Responsable Alto Principal(e)', 'Responsable Alto Adjoint(e)', 'Responsable Ténor Principal(e)',
+    'Responsable Ténor Adjoint(e)', 'Membre', 'Autre fonction',
+  ],
 
   genId(prefix) {
     return prefix + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
@@ -972,130 +1055,30 @@ const Utils = {
 
 const STORAGE_KEY = 'chorale_erp_data_v1';
 
-// ===== FIREBASE / FIRESTORE =====
-// Remplacez les valeurs ci-dessous par la configuration Web fournie dans
-// Firebase Console > Parametres du projet > Vos applications > Application Web.
-// Laissez apiKey vide pour utiliser uniquement le stockage local.
-const FIREBASE_CONFIG = {
-  apiKey: 'AIzaSyARm828relinxQ_1uoKebDHG1WOog4mRt0',
-  authDomain: 'chorale-svs-app-web-v9-3.firebaseapp.com',
-  projectId: 'chorale-svs-app-web-v9-3',
-  storageBucket: 'chorale-svs-app-web-v9-3.firebasestorage.app',
-  messagingSenderId: '497628233660',
-  appId: '1:497628233660:web:f45d82e23ca07ad609b5b9',
-};
-
-const FIRESTORE_STATE_PATH = ['chorale', 'data', 'main'];
-
-const FirebaseBridge = {
-  app: null,
-  db: null,
-  auth: null,
-  enabled: false,
-  ready: false,
-  unsub: null,
-  saveTimer: null,
-  remoteApplying: false,
-
-  isConfigured() {
-    return !!(FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.projectId && window.firebase);
-  },
-
-  async init(store) {
-    if (!this.isConfigured()) {
-      setSyncStatus && setSyncStatus('local');
-      return false;
-    }
-
-    try {
-      this.app = firebase.apps && firebase.apps.length ? firebase.app() : firebase.initializeApp(FIREBASE_CONFIG);
-      this.db = firebase.firestore();
-      this.auth = firebase.auth ? firebase.auth() : null;
-      this.enabled = true;
-      setSyncStatus && setSyncStatus('syncing');
-
-      if (this.auth && !this.auth.currentUser) {
-        try { await this.auth.signInAnonymously(); }
-        catch (authError) { console.warn('Connexion Firebase Auth anonyme impossible.', authError); }
-      }
-
-      await this.subscribe(store);
-      return true;
-    } catch (error) {
-      console.error('Firebase indisponible, repli localStorage.', error);
-      this.enabled = false;
-      setSyncStatus && setSyncStatus('error');
-      return false;
-    }
-  },
-
-  docRef() {
-    return this.db.collection(FIRESTORE_STATE_PATH[0]).doc(FIRESTORE_STATE_PATH[1]).collection('documents').doc(FIRESTORE_STATE_PATH[2]);
-  },
-
-  async subscribe(store) {
-    const ref = this.docRef();
-    const firstSnapshot = await ref.get();
-    if (!firstSnapshot.exists) {
-      await ref.set({ data: store.data, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
-    }
-
-    this.unsub = ref.onSnapshot((snapshot) => {
-      if (!snapshot.exists) return;
-      const payload = snapshot.data() || {};
-      if (!payload.data) return;
-      this.remoteApplying = true;
-      store.data = store._merge(structuredClone(SEED_DATA), payload.data);
-      store.recomputeAllCotisations_silent();
-      store._saveLocalOnly();
-      this.remoteApplying = false;
-      this.ready = true;
-      setSyncStatus && setSyncStatus('synced');
-      if (window.Router && document.querySelector('.app-shell')) {
-        try { Router.render(); updateSuggestionsBadge(); updateNotificationsBadge(); } catch (e) { console.warn('Rendu apres synchronisation impossible.', e); }
-      }
-    }, (error) => {
-      console.error('Ecoute Firestore interrompue.', error);
-      setSyncStatus && setSyncStatus('error');
-    });
-  },
-
-  scheduleSave(data) {
-    if (!this.enabled || this.remoteApplying) return;
-    clearTimeout(this.saveTimer);
-    setSyncStatus && setSyncStatus('syncing');
-    this.saveTimer = setTimeout(async () => {
-      try {
-        await this.docRef().set({ data, updatedAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
-        setSyncStatus && setSyncStatus('synced');
-      } catch (error) {
-        console.error('Ecriture Firestore impossible, copie locale conservee.', error);
-        setSyncStatus && setSyncStatus('error');
-      }
-    }, 450);
-  },
-};
-
 const Store = {
   data: null,
   _ready: false,
 
-  // Charge d'abord les donnees locales pour demarrer vite, puis branche
-  // Firestore en temps reel si FIREBASE_CONFIG est renseigne.
+  // Charge les données depuis le localStorage (ou initialise avec
+  // les données de base si c'est la première utilisation sur cet appareil).
   init() {
     let stored = null;
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) stored = JSON.parse(raw);
     } catch (e) {
-      console.warn('Lecture localStorage impossible, repli sur les donnees de base.', e);
+      console.warn('Lecture localStorage impossible, repli sur les données de base.', e);
     }
 
-    this.data = stored ? this._merge(structuredClone(SEED_DATA), stored) : structuredClone(SEED_DATA);
+    if (stored) {
+      this.data = this._merge(structuredClone(SEED_DATA), stored);
+    } else {
+      this.data = structuredClone(SEED_DATA);
+    }
+
     this.recomputeAllCotisations_silent();
     this._ready = true;
-    this._saveLocalOnly();
-    FirebaseBridge.init(this);
+    this.save();
     return this.data;
   },
 
@@ -1115,23 +1098,17 @@ const Store = {
     return out;
   },
 
-  _saveLocalOnly() {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.data));
-    } catch (e) {
-      console.error('Erreur d\'enregistrement local (localStorage plein ou indisponible)', e);
-      if (window.Utils && Utils.toast) Utils.toast('Erreur d\'enregistrement local - espace navigateur peut-etre plein');
-    }
-  },
-
-  // Ecrit localement puis synchronise vers Firestore quand Firebase est actif.
+  // Écrit immédiatement l'état courant dans le localStorage du navigateur.
   save() {
     if (!this._ready) return;
-    if (!this.data.meta) this.data.meta = {};
-    this.data.meta.lastUpdate = new Date().toISOString();
-    this._saveLocalOnly();
-    if (FirebaseBridge.enabled) FirebaseBridge.scheduleSave(this.data);
-    else setSyncStatus && setSyncStatus('local');
+    try {
+      this.data.meta.lastUpdate = new Date().toISOString();
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.data));
+      setSyncStatus && setSyncStatus('synced');
+    } catch (e) {
+      console.error('Erreur d\'enregistrement local (localStorage plein ou indisponible)', e);
+      Utils.toast('⚠️ Erreur d\'enregistrement local — l\'espace de stockage du navigateur est peut-être plein');
+    }
   },
 
   // Recalcule les cotisations sans déclencher une écriture (utilisé au chargement,
@@ -1163,6 +1140,323 @@ const Store = {
   getMembre(id) {
     return this.data.membres.find(m => m.id === id);
   },
+
+  // ── COMPTES CHORISTES INDIVIDUELS (2) ──
+  getCompteChoriste(membreId) { return this.data.comptesChoristes[membreId] || null; },
+
+  async createCompteChoriste(membreId, password) {
+    const hash = await Utils.hashPassword(password);
+    this.data.comptesChoristes[membreId] = {
+      matricule: membreId,
+      motDePasseHash: hash,
+      doitChangerMotDePasse: false,
+      dateCreation: Utils.todayISO(),
+      dernieresConnexions: [],
+      statutCompte: 'Actif',
+    };
+    this.save();
+    this.logAction('Création', 'Membres', `Compte choriste créé — ${membreId}`);
+  },
+
+  async verifyChoristePassword(membreId, password) {
+    const compte = this.getCompteChoriste(membreId);
+    if (!compte || !compte.motDePasseHash) return false;
+    const hash = await Utils.hashPassword(password);
+    return hash === compte.motDePasseHash;
+  },
+
+  async changeChoristePassword(membreId, ancien, nouveau) {
+    const ok = await this.verifyChoristePassword(membreId, ancien);
+    if (!ok) return false;
+    this.data.comptesChoristes[membreId].motDePasseHash = await Utils.hashPassword(nouveau);
+    this.data.comptesChoristes[membreId].doitChangerMotDePasse = false;
+    this.save();
+    this.logAction('Modification', 'Membres', `Mot de passe changé par le choriste — ${membreId}`);
+    return true;
+  },
+
+  // Réinitialisation par l'Admin : invalide le mot de passe, le choriste en
+  // recrée un à sa prochaine connexion (même écran que la 1ère connexion).
+  resetChoristePassword(membreId) {
+    const compte = this.getCompteChoriste(membreId);
+    if (compte) {
+      compte.motDePasseHash = null;
+      compte.doitChangerMotDePasse = true;
+    } else {
+      this.data.comptesChoristes[membreId] = {
+        matricule: membreId, motDePasseHash: null, doitChangerMotDePasse: true,
+        dateCreation: Utils.todayISO(), dernieresConnexions: [], statutCompte: 'Actif',
+      };
+    }
+    this.save();
+    this.logAction('Réinitialisation', 'Membres', `Mot de passe réinitialisé par l'administrateur — ${membreId}`);
+  },
+
+  toggleCompteChoristeStatut(membreId, statut) {
+    const compte = this.getCompteChoriste(membreId);
+    if (compte) { compte.statutCompte = statut; this.save(); }
+  },
+
+  recordConnexionChoriste(membreId) {
+    const compte = this.getCompteChoriste(membreId);
+    if (!compte) return;
+    if (!compte.dernieresConnexions) compte.dernieresConnexions = [];
+    compte.dernieresConnexions.unshift(new Date().toISOString());
+    compte.dernieresConnexions = compte.dernieresConnexions.slice(0, 20);
+    this.save();
+  },
+
+  // Conserve le compte (mot de passe, historique de connexions) lors du
+  // passage Intégrant → Choriste, car le matricule (= id du membre) change.
+  migrateCompteChoriste(oldId, newId) {
+    const c = this.data.comptesChoristes[oldId];
+    if (c) {
+      c.matricule = newId;
+      this.data.comptesChoristes[newId] = c;
+      delete this.data.comptesChoristes[oldId];
+      this.save();
+    }
+  },
+
+  // ── GESTION DES TOGES (module Discipline) ──
+  TOGE_ETATS: ['Disponible', 'Utilisée', 'Usée', 'Déchirée', 'En réparation', 'Hors service'],
+  TOGE_SEUIL_STOCK_FAIBLE: 2, // alerte si moins de N toges disponibles pour un type
+
+  getTypesToges() { return this.data.typesToges.slice(); },
+  addTypeToge(nom) {
+    if (!nom || this.data.typesToges.indexOf(nom) !== -1) return;
+    this.data.typesToges.push(nom);
+    this.save();
+    this.logAction('Ajout', 'Discipline', `Nouveau type de toge — ${nom}`);
+  },
+
+  getToges(filter) {
+    let list = this.data.toges.slice();
+    if (filter) {
+      if (filter.type) list = list.filter(t => t.type === filter.type);
+      if (filter.etat) list = list.filter(t => t.etat === filter.etat);
+      if (filter.attribuee === true) list = list.filter(t => !!t.attribueA);
+      if (filter.attribuee === false) list = list.filter(t => !t.attribueA);
+    }
+    return list.sort((a,b) => (a.code||'').localeCompare(b.code||''));
+  },
+  getToge(id) { return this.data.toges.find(t => t.id === id); },
+
+  addToge(toge) {
+    if (!toge.historique) toge.historique = [{ date: Utils.todayISO(), action: 'Ajout au stock', par: Permissions.role, details: toge.etat }];
+    this.data.toges.push(toge);
+    this.save();
+    this.logAction('Ajout', 'Discipline', `Toge ajoutée — ${toge.type} ${toge.code}`);
+  },
+
+  updateToge(id, patch) {
+    const t = this.getToge(id);
+    if (t) Object.assign(t, patch);
+    this.save();
+  },
+
+  deleteToge(id) { this.data.toges = this.data.toges.filter(t => t.id !== id); this.save(); },
+
+  // Change l'état d'une toge et conserve l'historique (3, 5).
+  changerEtatToge(id, nouvelEtat) {
+    const t = this.getToge(id);
+    if (!t) return null;
+    if (!t.historique) t.historique = [];
+    const ancien = t.etat;
+    t.etat = nouvelEtat;
+    t.historique.push({ date: Utils.todayISO(), action: `Changement d'état : ${ancien} → ${nouvelEtat}`, par: Permissions.role });
+    this.save();
+    this.logAction('Modification', 'Discipline', `Toge ${t.code} — état : ${nouvelEtat}`);
+    return t;
+  },
+
+  // Attribution à un choriste (2, 5).
+  attribuerToge(togeId, membreId, observations) {
+    const t = this.getToge(togeId);
+    const m = this.getMembre(membreId);
+    if (!t || !m) return null;
+    if (!t.historique) t.historique = [];
+    t.attribueA = membreId;
+    t.dateAttribution = Utils.todayISO();
+    t.observations = observations || '';
+    t.etat = 'Utilisée';
+    t.historique.push({ date: Utils.todayISO(), action: `Attribuée à ${m.nom}`, par: Permissions.role });
+    this.save();
+    this.logAction('Attribution', 'Discipline', `Toge ${t.code} attribuée à ${m.nom}`);
+    return t;
+  },
+
+  // Restitution / réattribution (5).
+  restituerToge(togeId) {
+    const t = this.getToge(togeId);
+    if (!t) return null;
+    if (!t.historique) t.historique = [];
+    const ancien = t.attribueA ? (this.getMembre(t.attribueA)||{}).nom : null;
+    t.historique.push({ date: Utils.todayISO(), action: `Restituée${ancien?(' par '+ancien):''}`, par: Permissions.role });
+    t.attribueA = null;
+    t.dateAttribution = null;
+    t.etat = 'Disponible';
+    this.save();
+    this.logAction('Restitution', 'Discipline', `Toge ${t.code} restituée`);
+    return t;
+  },
+
+  getTogesStats() {
+    const all = this.data.toges;
+    const parType = {};
+    this.data.typesToges.forEach(type => {
+      const sub = all.filter(t => t.type === type);
+      parType[type] = {
+        total: sub.length,
+        bonEtat: sub.filter(t => t.etat==='Disponible'||t.etat==='Utilisée').length,
+        usees: sub.filter(t => t.etat==='Usée').length,
+        dechirees: sub.filter(t => t.etat==='Déchirée').length,
+        reparation: sub.filter(t => t.etat==='En réparation').length,
+        disponibles: sub.filter(t => t.etat==='Disponible').length,
+        attribuees: sub.filter(t => !!t.attribueA).length,
+      };
+    });
+    const choristesEligibles = this.data.membres.filter(m => m.statut==='Choriste' || m.statut==='Intégrant');
+    const avecToge = choristesEligibles.filter(m => all.some(t => t.attribueA === m.id));
+    const sansToge = choristesEligibles.filter(m => !all.some(t => t.attribueA === m.id));
+    return {
+      total: all.length,
+      disponibles: all.filter(t=>t.etat==='Disponible').length,
+      attribuees: all.filter(t=>!!t.attribueA).length,
+      mauvaisEtat: all.filter(t=>t.etat==='Usée'||t.etat==='Déchirée'||t.etat==='Hors service').length,
+      reparation: all.filter(t=>t.etat==='En réparation').length,
+      parType,
+      avecToge, sansToge,
+    };
+  },
+
+  getTogesAlertes() {
+    const stats = this.getTogesStats();
+    const alertes = [];
+    Object.keys(stats.parType).forEach(type => {
+      if (stats.parType[type].disponibles < this.TOGE_SEUIL_STOCK_FAIBLE) {
+        alertes.push({ type: 'stock', message: `Stock faible — ${type} (${stats.parType[type].disponibles} disponible(s))` });
+      }
+    });
+    this.data.toges.filter(t=>t.etat==='Déchirée').forEach(t => alertes.push({ type: 'dechiree', message: `Toge déchirée — ${t.type} ${t.code}` }));
+    this.data.toges.filter(t=>t.etat==='Hors service').forEach(t => alertes.push({ type: 'hs', message: `Toge hors service — ${t.type} ${t.code}` }));
+    if (stats.sansToge.length) alertes.push({ type: 'sans-toge', message: `${stats.sansToge.length} choriste(s)/intégrant(s) sans toge` });
+    return alertes;
+  },
+
+  // ── DEMANDES DE MODIFICATION (7.6) ──
+  // Champs de la fiche membre qu'un choriste est autorisé à proposer de modifier.
+  DEMANDE_CHAMPS_AUTORISES: ['dateNaissance', 'telephone', 'adresse', 'email', 'observations', 'jouesInstrument', 'instruments'],
+  getDemandesModification(filter) {
+    let list = this.data.demandesModification.slice().sort((a,b)=>b.dateDemande.localeCompare(a.dateDemande));
+    if (filter && filter.membreId) list = list.filter(d => d.membreId === filter.membreId);
+    if (filter && filter.statut) list = list.filter(d => d.statut === filter.statut);
+    return list;
+  },
+  addDemandeModification(d) {
+    d.statut = 'En attente';
+    d.dateDemande = Utils.todayISO();
+    this.data.demandesModification.push(d);
+    this.save();
+    this.logAction('Ajout', 'Membres', `Demande de modification soumise par ${d.membreId}`);
+  },
+  // Applique la demande à la fiche membre UNIQUEMENT si validée par l'Admin —
+  // aucune écriture directe sur Store.data.membres n'a lieu avant cette étape.
+  traiterDemandeModification(id, accepte, motifRefus) {
+    const d = this.data.demandesModification.find(x => x.id === id);
+    if (!d) return null;
+    if (accepte) {
+      const m = this.getMembre(d.membreId);
+      if (m) {
+        Object.keys(d.champs).forEach(champ => { m[champ] = d.champs[champ]; });
+        this.upsertMembre(m);
+      }
+      d.statut = 'Validée';
+    } else {
+      d.statut = 'Refusée';
+      d.motifRefus = motifRefus || '';
+    }
+    d.dateTraitement = Utils.todayISO();
+    this.save();
+    this.logAction(accepte ? 'Validation' : 'Refus', 'Membres', `Demande de modification de ${d.membreId} : ${d.statut}`);
+    return d;
+  },
+
+  // ── INSTRUMENTISTES (sous-module Musique) ──
+  getInstrumentistes() { return this.data.instrumentistes.slice().sort((a,b)=>a.nom.localeCompare(b.nom)); },
+  getInstrumentiste(id) { return this.data.instrumentistes.find(i=>i.id===id); },
+  upsertInstrumentiste(fiche) {
+    const idx = this.data.instrumentistes.findIndex(i=>i.id===fiche.id);
+    if (idx>=0) this.data.instrumentistes[idx] = fiche; else this.data.instrumentistes.push(fiche);
+    this.save();
+    this.logAction(idx>=0?'Modification':'Ajout', 'Musique', `Fiche instrumentiste — ${fiche.nom}`);
+  },
+  deleteInstrumentiste(id) { this.data.instrumentistes = this.data.instrumentistes.filter(i=>i.id!==id); this.save(); },
+
+  getRepetitionsInstrumentales() { return this.data.repetitionsInstrumentales.slice().sort((a,b)=>b.date.localeCompare(a.date)); },
+  addRepetitionInstrumentale(r) {
+    this.data.repetitionsInstrumentales.push(r);
+    this.save();
+    this.logAction('Ajout', 'Musique', `Répétition instrumentale — ${r.date}`);
+  },
+  updateRepetitionInstrumentale(id, patch) {
+    const r = this.data.repetitionsInstrumentales.find(x=>x.id===id);
+    if (r) Object.assign(r, patch);
+    this.save();
+  },
+  deleteRepetitionInstrumentale(id) { this.data.repetitionsInstrumentales = this.data.repetitionsInstrumentales.filter(r=>r.id!==id); this.save(); },
+
+  // ── ARCHIVES DES ANCIENS CHORISTES (Admin uniquement) ──
+  // Transfère un membre vers les archives et le retire des membres actifs —
+  // il disparaît donc automatiquement des cotisations, présences et listes
+  // de membres actifs, sans qu'aucune autre logique n'ait besoin d'être
+  // modifiée (elles lisent toutes Store.data.membres).
+  archiverMembre(membreId, { dateDepart, motifDepart }) {
+    const m = this.getMembre(membreId);
+    if (!m) return null;
+    const anneesService = (() => {
+      if (!m.dateEntree) return null;
+      const d1 = new Date(m.dateEntree), d2 = new Date(dateDepart || Utils.todayISO());
+      return Math.max(0, Math.round((d2-d1)/(365.25*24*3600*1000)*10)/10);
+    })();
+    const archive = {
+      id: Utils.genId('arc'),
+      nom: m.nom, prenom: m.prenom || '', sexe: m.sexe, voix: m.pupitre || '',
+      photo: m.photo || '', dateEntree: m.dateEntree || '',
+      dateDepart: dateDepart || Utils.todayISO(),
+      motifDepart: motifDepart || 'Autre',
+      services: [m.statut].filter(Boolean),
+      fonctions: [m.fonction].filter(Boolean),
+      anneesService,
+      temoignage: '',
+      galerie: [],
+    };
+    this.data.archives.push(archive);
+    this.deleteMembre(membreId);
+    this.save();
+    this.logAction('Archivage', 'Membres', `${m.nom} archivé(e) — motif : ${archive.motifDepart}`);
+    return archive;
+  },
+  getArchives() { return this.data.archives.slice().sort((a,b)=>(b.dateDepart||'').localeCompare(a.dateDepart||'')); },
+  getArchive(id) { return this.data.archives.find(a=>a.id===id); },
+  updateArchive(id, patch) {
+    const a = this.data.archives.find(x=>x.id===id);
+    if (a) Object.assign(a, patch);
+    this.save();
+  },
+  deleteArchive(id) { this.data.archives = this.data.archives.filter(a=>a.id!==id); this.save(); },
+  getArchivesStats() {
+    const all = this.data.archives;
+    const parMotif = {};
+    const parPromotion = {};
+    all.forEach(a => {
+      parMotif[a.motifDepart] = (parMotif[a.motifDepart]||0) + 1;
+      const promo = a.dateEntree ? a.dateEntree.slice(0,4) : 'Inconnue';
+      parPromotion[promo] = (parPromotion[promo]||0) + 1;
+    });
+    return { total: all.length, parMotif, parPromotion };
+  },
+
 
   upsertMembre(membre) {
     const idx = this.data.membres.findIndex(m => m.id === membre.id);
@@ -1282,6 +1576,13 @@ const Store = {
     return this.data.evaluations[membreId] || null;
   },
   setEvaluation(membreId, evalData) {
+    // Conserve un historique horodaté (notes + niveau de maîtrise musicale
+    // pour les instrumentistes) sans changer la structure lue ailleurs
+    // (ev.notes reste accessible exactement comme avant).
+    const existing = this.data.evaluations[membreId];
+    const historique = (existing && existing.historique) ? existing.historique.slice() : [];
+    historique.push({ date: evalData.date || Utils.todayISO(), notes: evalData.notes, niveauMaitrise: evalData.niveauMaitrise || null });
+    evalData.historique = historique;
     this.data.evaluations[membreId] = evalData;
     this.save();
   },
@@ -1295,9 +1596,41 @@ const Store = {
     this.data.cotisations[membreId][monthKey] = montant;
     this.save();
   },
-  getCotisationDue(membre) {
-    if (membre.statut === 'Bureau') return 500;
+  // Cotisation due pour un mois donné (ou le mois courant si non précisé).
+  // Règles (juin 2026) :
+  //  - Intégrant : 0 FCFA, toujours.
+  //  - Choriste : 250 FCFA/mois, sauf avant sa date d'intégration officielle
+  //    (dateIntegration) s'il a été Intégrant — aucune dette rétroactive.
+  //  - Bureau : 250 FCFA/mois avant sa date de prise de fonction
+  //    (datePriseFonction), 500 FCFA/mois à partir de ce mois-ci. Si la date
+  //    n'est pas renseignée (anciennes fiches), on garde l'ancien
+  //    comportement (500 FCFA) pour ne rien casser.
+  getCotisationDue(membre, monthKey) {
+    if (!membre) return 0;
+    if (membre.statut === 'Intégrant') return 0;
+
+    const refMonth = monthKey || Utils.monthKey();
+
+    if (membre.dateIntegration && refMonth < membre.dateIntegration.slice(0,7)) return 0;
+
+    if (membre.statut === 'Bureau') {
+      if (membre.datePriseFonction) {
+        const priseMonth = membre.datePriseFonction.slice(0,7);
+        return refMonth >= priseMonth ? 500 : 250;
+      }
+      return 500;
+    }
     return 250;
+  },
+
+  // Total dû sur une année civile, en respectant les règles ci-dessus
+  // mois par mois (remplace l'ancien calcul plat "getCotisationDue() * 12").
+  getCotisationDueAnnuel(membre, year) {
+    let total = 0;
+    for (let mo = 1; mo <= 12; mo++) {
+      total += this.getCotisationDue(membre, `${year}-${String(mo).padStart(2,'0')}`);
+    }
+    return total;
   },
 
   // ── FINANCE — PAIEMENTS (historique, statuts, validation) ────────────
@@ -1404,7 +1737,7 @@ const Store = {
   // des paiements en attente éventuels.
   getStatutPaiement(membreId, monthKey) {
     const membre = this.getMembre(membreId);
-    const due = membre ? this.getCotisationDue(membre) : 0;
+    const due = membre ? this.getCotisationDue(membre, monthKey) : 0;
     const valide = this.getCotisation(membreId, monthKey);
     const enAttente = this.data.paiements
       .filter(p => p.membreId === membreId && p.monthKey === monthKey && p.statut === 'En attente')
@@ -1621,6 +1954,16 @@ const Store = {
     this.data.testsIntegration[membreId] = testData;
     this.save();
   },
+  // Conserve le test d'intégration (date, note, observations, décision) lors
+  // du passage Intégrant → Choriste, car l'identifiant du membre change.
+  migrateTestIntegration(oldId, newId) {
+    const t = this.data.testsIntegration[oldId];
+    if (t) {
+      this.data.testsIntegration[newId] = t;
+      delete this.data.testsIntegration[oldId];
+      this.save();
+    }
+  },
 
   // ── IGI CALCULATION ──
   calcIGI(membreId) {
@@ -1633,7 +1976,7 @@ const Store = {
     const monthKeys = [];
     const year = this.data.meta.annee;
     for (let m=1;m<=12;m++) monthKeys.push(`${year}-${String(m).padStart(2,'0')}`);
-    const due = this.getCotisationDue(membre) * 12;
+    const due = this.getCotisationDueAnnuel(membre, year);
     const paid = monthKeys.reduce((sum,k)=>sum + this.getCotisation(membreId,k), 0);
     const txCotis = due > 0 ? Math.min(paid/due, 1) : 0;
     const scoreTresorerie = Math.round(txCotis * 25 * 10) / 10;
@@ -1749,7 +2092,7 @@ const Store = {
     let due = 0, paid = 0;
     for (let mo = 1; mo <= Math.max(moisEcoules, 1); mo++) {
       const key = `${year}-${String(mo).padStart(2,'0')}`;
-      due += this.getCotisationDue(membre);
+      due += this.getCotisationDue(membre, key);
       paid += this.getCotisation(membreId, key);
     }
     const tauxCotis = due > 0 ? Math.min(paid/due, 1) : 1;
@@ -1785,10 +2128,31 @@ const Store = {
   },
 
   // Classement trié (catégorie : 'musical' | 'discipline' | 'tresorerie' | 'global')
-  // Restreint aux Choristes (cœur de cible des classements de chorale).
+  // Règles (7.3) :
+  //  - Classements par département (musical/discipline/tresorerie) : Choristes
+  //    + membres du Bureau, statut "Actif" uniquement ; exclut les Intégrants
+  //    ainsi que le Responsable Principal et le Responsable Adjoint du
+  //    département concerné (basé sur le champ "fonction").
+  //  - Classement général (global) : uniquement les Choristes "Actif" ;
+  //    exclut tous les Intégrants et tous les membres du Bureau.
+  CLASSEMENT_EXCLUSIONS: {
+    tresorerie: ['Trésorier(e) Principal(e)', 'Trésorier(e) Adjoint(e)'],
+    discipline: ['Chargé(e) de Discipline Principal(e)', 'Chargé(e) de Discipline Adjoint(e)'],
+    musical:    ['Directeur de Chœur Principal', 'Directeur de Chœur Adjoint(e)'],
+  },
   getClassement(categorie) {
-    const choristes = this.data.membres.filter(m => m.statut === 'Choriste');
-    const rows = choristes.map(m => {
+    let pool;
+    if (categorie === 'global') {
+      pool = this.data.membres.filter(m => m.statut === 'Choriste' && m.situation === 'Actif');
+    } else {
+      const excluded = this.CLASSEMENT_EXCLUSIONS[categorie] || [];
+      pool = this.data.membres.filter(m =>
+        (m.statut === 'Choriste' || m.statut === 'Bureau') &&
+        m.situation === 'Actif' &&
+        excluded.indexOf(m.fonction) === -1
+      );
+    }
+    const rows = pool.map(m => {
       let detail;
       if (categorie === 'musical') detail = this.calcScoreMusical(m.id);
       else if (categorie === 'discipline') detail = this.calcScoreDiscipline(m.id);
@@ -2116,35 +2480,36 @@ const Router = {
 // ════════════════════════════════════════════════════════════════
 
 const DEPARTEMENTS = [
-  { key: 'membres',     label: 'Membres',                          icon: '👥' },
-  { key: 'discipline',  label: 'Discipline',                       icon: '⚖️' },
-  { key: 'tresorerie',  label: 'Trésorerie',                       icon: '💰' },
-  { key: 'secretariat', label: 'Secrétariat',                      icon: '📅' },
-  { key: 'direction',   label: 'Direction Technique & Répertoire', icon: '🎼' },
-  { key: 'prestations', label: 'Prestations',                      icon: '🎤' },
-  { key: 'repetitions', label: 'Répétitions',                      icon: '🎹' },
+  { key: 'secretariat', label: 'Secrétariat',       icon: '📅' },
+  { key: 'tresorerie',  label: 'Trésorerie',        icon: '💰' },
+  { key: 'discipline',  label: 'Discipline',         icon: '⚖️' },
+  { key: 'direction',   label: 'Direction Technique',icon: '🎼' },
 ];
+// NB : "Membres" n'est pas un département — c'est un accès partagé
+// accordé à tout le bureau (SHARED_BUREAU_DEPTS ci-dessous).
+// Prestations et Répétitions font partie de la Direction Technique
+// (EXTRA_DEPTS_FOR ci-dessous).
 
-// Routes de navigation correspondant chacune à un département ci-dessus
-// (utilisé pour filtrer la navigation et bloquer l'accès direct par URL).
+// Routes de navigation → département responsable.
+// prestations et repetitions sont sous la Direction Technique.
+// membres = accès partagé tout-bureau (null = pas de restriction dept).
 const DEPT_FOR_ROUTE = {
-  membres: 'membres', discipline: 'discipline', tresorerie: 'tresorerie',
-  secretariat: 'secretariat', direction: 'direction',
-  prestations: 'prestations', repetitions: 'repetitions',
+  membres:     null,
+  discipline:  'discipline',
+  tresorerie:  'tresorerie',
+  secretariat: 'secretariat',
+  direction:   'direction',
+  prestations: 'direction',
+  repetitions: 'direction',
 };
 
 // ── Extensions de droits (additif) ──────────────────────────────────
-// SHARED_BUREAU_DEPTS : départements accessibles (consultation + gestion)
-// par TOUT compte Bureau, quel que soit son département attitré.
-// → "Membres" : tout le bureau peut consulter, ajouter et modifier les
-//   membres, en plus de la gestion de son propre département.
+// SHARED_BUREAU_DEPTS : modules gérables par TOUT le bureau.
+// "membres" : consultation + modification accessibles à tous les depts.
 const SHARED_BUREAU_DEPTS = ['membres'];
 
-// EXTRA_DEPTS_FOR : départements supplémentaires accordés au titulaire
-// d'UN département précis (en plus du sien).
-// → Le Bureau "Direction Technique" gère aussi entièrement les
-//   Prestations et les Répétitions (création, modification, suppression,
-//   pointage des présences).
+// EXTRA_DEPTS_FOR : modules supplémentaires inclus dans un département.
+// La Direction Technique couvre aussi Prestations et Répétitions.
 const EXTRA_DEPTS_FOR = {
   direction: ['prestations', 'repetitions'],
 };
@@ -2366,6 +2731,19 @@ const Permissions = {
 const ADMIN_PASSWORD = 'JosephT2026';
 const CHORISTE_PASSWORD = 'Chocho2026Svs';
 
+// ── Mots de passe des départements (indexés par clé de département) ──
+// Chaque département possède son propre mot de passe partagé par tous
+// les membres de ce département. Il n'y a plus d'identifiant individuel :
+// la sélection du département suffit, puis le membre saisit le mot de
+// passe de son département pour y accéder.
+const BUREAU_DEPT_PASSWORDS = {
+  secretariat: 'SvsOzi2026',
+  tresorerie:  'SvsRosi2026',
+  discipline:  'SvsJac2026',
+  direction:   'SvsGed2026',
+};
+
+// Conservé pour rétrocompatibilité (anciens profils sauvegardés)
 const BUREAU_ACCOUNTS = {
   'Bureau2026Se': { password: 'SvsOzi2026',  departement: 'secretariat', label: 'Secrétariat' },
   'Bureau2026Te': { password: 'SvsRosi2026', departement: 'tresorerie',  label: 'Trésorerie' },
@@ -2375,13 +2753,12 @@ const BUREAU_ACCOUNTS = {
 
 // ===== SURCHARGE LOCALE DES MOTS DE PASSE (additif) =====
 // ════════════════════════════════════════════════════════════════
-// Permet à l'Administrateur et aux comptes Bureau de changer leur propre
-// mot de passe depuis l'application (Paramètres). Les mots de passe
-// d'origine ci-dessus (ADMIN_PASSWORD / BUREAU_ACCOUNTS) ne sont JAMAIS
-// modifiés : les nouveaux mots de passe sont stockés à part, dans le
-// localStorage de cet appareil, et consultés en priorité à la connexion.
-// (Choisir un nouveau mot de passe sur un appareil ne le change pas sur
-// les autres appareils, puisqu'il n'y a pas de serveur central.)
+// Permet à l'Administrateur et aux responsables de département de
+// changer le mot de passe de leur département depuis l'application.
+// Les mots de passe d'origine (BUREAU_DEPT_PASSWORDS) ne sont JAMAIS
+// modifiés dans le code : les nouveaux mots de passe sont stockés dans
+// le localStorage et consultés en priorité à la connexion.
+// Un historique des modifications est conservé dans le journal d'audit.
 // ════════════════════════════════════════════════════════════════
 
 const CREDENTIALS_OVERRIDE_KEY = 'chorale_erp_credentials_v1';
@@ -2405,10 +2782,37 @@ const CredentialsStore = {
     o.admin = newPassword;
     this._write(o);
   },
+
+  // ── Mots de passe des départements (par clé de département) ──
+  getDeptPassword(deptKey) {
+    const o = this._read();
+    if (o.depts && o.depts[deptKey]) return o.depts[deptKey];
+    return BUREAU_DEPT_PASSWORDS[deptKey] || null;
+  },
+  setDeptPassword(deptKey, newPassword) {
+    const o = this._read();
+    if (!o.depts) o.depts = {};
+    o.depts[deptKey] = newPassword;
+    this._write(o);
+  },
+  resetDeptPassword(deptKey) {
+    // Réinitialise au mot de passe par défaut en supprimant la surcharge
+    const o = this._read();
+    if (o.depts && o.depts[deptKey]) {
+      delete o.depts[deptKey];
+      this._write(o);
+    }
+  },
+
+  // Rétrocompatibilité — ancien système avec identifiant individuel
   getBureauPassword(bureauId) {
     const o = this._read();
+    // Cherche d'abord par identifiant ancien format
     if (o.bureau && o.bureau[bureauId]) return o.bureau[bureauId];
-    return BUREAU_ACCOUNTS[bureauId] ? BUREAU_ACCOUNTS[bureauId].password : null;
+    const acc = BUREAU_ACCOUNTS[bureauId];
+    if (!acc) return null;
+    // Tente de lire le mot de passe du département correspondant
+    return this.getDeptPassword(acc.departement);
   },
   setBureauPassword(bureauId, newPassword) {
     const o = this._read();
@@ -2489,7 +2893,8 @@ const ProfileSelectorUI = {
     const c = this._container;
     if (this.step === 'role') return this._renderRole(c);
     if (this.step === 'login') return this._renderLogin(c);
-    if (this.step === 'identity') return this._renderIdentity(c);
+    if (this.step === 'choriste-login') return this._renderChoristeLogin(c);
+    if (this.step === 'choriste-create') return this._renderChoristeCreate(c);
   },
 
   _shell(title, subtitle, bodyHtml, showBack) {
@@ -2502,7 +2907,7 @@ const ProfileSelectorUI = {
           ${bodyHtml}
           ${showBack ? `<div class="auth-links mt-16"><a href="#" id="ps-back">← Retour</a></div>` : ''}
         </div>
-        <div class="auth-footer">🎵 Chorale — Carnet de Gestion · Données stockées sur cet appareil</div>
+        <div class="auth-footer">🎵 SVS-EEI · Données stockées sur cet appareil</div>
       </div>
     `;
   },
@@ -2514,7 +2919,7 @@ const ProfileSelectorUI = {
       { key: 'admin',    icon: '👑', label: 'Administrateur', desc: 'Contrôle total de l\'application' },
     ];
     c.innerHTML = this._shell(
-      'Carnet de Chorale',
+      'SVS-EEI',
       'Quel est votre rôle ?',
       `<div style="display:flex;flex-direction:column;gap:10px;text-align:left;">
         ${roles.map(r => `
@@ -2532,7 +2937,7 @@ const ProfileSelectorUI = {
     c.querySelectorAll('[data-role]').forEach(btn => {
       btn.addEventListener('click', () => {
         this.selection.role = btn.dataset.role;
-        this.step = 'login';
+        this.step = btn.dataset.role === 'choriste' ? 'choriste-login' : 'login';
         this.render();
       });
     });
@@ -2547,20 +2952,19 @@ const ProfileSelectorUI = {
       return;
     }
 
-    const bureauFields = `
-      <div class="field" style="text-align:left;">
-        <label>Identifiant</label>
-        <input type="text" id="ps-login-id" autocomplete="off" placeholder="Votre identifiant de département">
-      </div>
-    `;
+    // ── Bureau : sélection du département puis mot de passe ──
+    if (role === 'bureau') {
+      this._renderBureauDeptSelect(c);
+      return;
+    }
 
+    // ── Administrateur : mot de passe unique ──
     c.innerHTML = this._shell(
       roleLabel,
       'Veuillez vous connecter',
       `
         <div id="ps-login-error" class="auth-error" style="display:none;"></div>
         <form id="ps-login-form">
-          ${role === 'bureau' ? bureauFields : ''}
           <div class="field" style="text-align:left;">
             <label>Mot de passe</label>
             <input type="password" id="ps-login-pass" autocomplete="current-password" placeholder="••••••••">
@@ -2581,6 +2985,105 @@ const ProfileSelectorUI = {
       this.step = 'role';
       this.render();
     });
+  },
+
+  // ── Bureau : étape 1 — sélection du département ──
+  _renderBureauDeptSelect(c) {
+    const depts = DEPARTEMENTS;
+    c.innerHTML = this._shell(
+      'Membre du Bureau',
+      'Sélectionnez votre département',
+      `
+        <div style="display:flex;flex-direction:column;gap:8px;text-align:left;">
+          ${depts.map(d => `
+            <button class="card" data-dept="${d.key}" style="display:flex;align-items:center;gap:12px;cursor:pointer;border:1px solid var(--line);width:100%;text-align:left;background:var(--paper);font-family:var(--font-body);color:var(--ink);padding:12px 14px;border-radius:var(--radius-m);">
+              <span style="font-size:1.5rem;">${d.icon}</span>
+              <span style="font-weight:700;font-size:0.95rem;">${d.label}</span>
+            </button>
+          `).join('')}
+        </div>
+      `,
+      true
+    );
+
+    c.querySelectorAll('[data-dept]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        this.selection.departement = btn.dataset.dept;
+        this._renderBureauDeptPassword(c);
+      });
+    });
+
+    c.querySelector('#ps-back').addEventListener('click', (e) => {
+      e.preventDefault();
+      this.step = 'role';
+      this.render();
+    });
+  },
+
+  // ── Bureau : étape 2 — saisie du mot de passe du département ──
+  _renderBureauDeptPassword(c) {
+    if (LoginSecurity.isLocked()) {
+      this._renderLocked(c, 'Membre du Bureau');
+      return;
+    }
+    const deptKey = this.selection.departement;
+    const dept = DEPARTEMENTS.find(d => d.key === deptKey);
+    const deptLabel = dept ? dept.label : deptKey;
+    const deptIcon  = dept ? dept.icon : '🗂️';
+
+    c.innerHTML = this._shell(
+      `${deptIcon} ${deptLabel}`,
+      'Saisissez le mot de passe de votre département',
+      `
+        <div id="ps-login-error" class="auth-error" style="display:none;"></div>
+        <form id="ps-dept-pwd-form">
+          <div class="field" style="text-align:left;">
+            <label>Mot de passe du département</label>
+            <input type="password" id="ps-dept-pass" autocomplete="current-password" placeholder="••••••••" autofocus>
+          </div>
+          <button type="submit" class="btn primary block mt-8">Accéder</button>
+        </form>
+        <div class="auth-links mt-16">
+          <a href="#" id="ps-back-dept">← Choisir un autre département</a>
+        </div>
+      `,
+      false
+    );
+
+    c.querySelector('#ps-dept-pwd-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      this._submitBureauDeptLogin(c);
+    });
+
+    c.querySelector('#ps-back-dept').addEventListener('click', (e) => {
+      e.preventDefault();
+      this._renderBureauDeptSelect(c);
+    });
+  },
+
+  // ── Bureau : validation du mot de passe de département ──
+  _submitBureauDeptLogin(c) {
+    const deptKey  = this.selection.departement;
+    const password = c.querySelector('#ps-dept-pass').value;
+    const errorEl  = c.querySelector('#ps-login-error');
+    errorEl.style.display = 'none';
+
+    const expected = CredentialsStore.getDeptPassword(deptKey);
+    if (expected && password === expected) {
+      LoginSecurity.recordSuccess();
+      // bureauId = null dans le nouveau système (pas d'identifiant individuel)
+      this.selection.bureauId = null;
+      this._finish();
+    } else {
+      LoginSecurity.recordFailure();
+      if (LoginSecurity.isLocked()) {
+        this._renderLocked(c, 'Membre du Bureau');
+        return;
+      }
+      const left = LoginSecurity.attemptsLeft();
+      errorEl.textContent = `Mot de passe incorrect. ${left} tentative(s) restante(s) avant blocage temporaire.`;
+      errorEl.style.display = '';
+    }
   },
 
   _renderLocked(c, roleLabel) {
@@ -2614,93 +3117,158 @@ const ProfileSelectorUI = {
     errorEl.style.display = 'none';
 
     let ok = false;
-    let departement = null;
-    let bureauId = null;
 
     if (role === 'admin') {
       ok = password === CredentialsStore.getAdminPassword();
-    } else if (role === 'choriste') {
-      ok = password === CHORISTE_PASSWORD;
-    } else if (role === 'bureau') {
-      const id = c.querySelector('#ps-login-id').value.trim();
-      const account = BUREAU_ACCOUNTS[id];
-      if (account && CredentialsStore.getBureauPassword(id) === password) {
-        ok = true;
-        departement = account.departement;
-        bureauId = id;
-      }
     }
+    // Note : le cas 'bureau' est désormais traité par _submitBureauDeptLogin()
 
     if (ok) {
       LoginSecurity.recordSuccess();
-      this.selection.departement = departement;
-      this.selection.bureauId = bureauId;
-      if (role === 'choriste') {
-        this.step = 'identity';
-        this.render();
-        return;
-      }
       this._finish();
     } else {
       LoginSecurity.recordFailure();
       if (LoginSecurity.isLocked()) {
-        this._renderLocked(c, role === 'admin' ? 'Administrateur' : role === 'bureau' ? 'Membre du Bureau' : 'Choriste');
+        this._renderLocked(c, role === 'admin' ? 'Administrateur' : 'Choriste');
         return;
       }
       const left = LoginSecurity.attemptsLeft();
-      errorEl.textContent = `Identifiant ou mot de passe incorrect. ${left} tentative(s) restante(s) avant blocage temporaire.`;
+      errorEl.textContent = `Mot de passe incorrect. ${left} tentative(s) restante(s) avant blocage temporaire.`;
       errorEl.style.display = '';
     }
   },
 
-  // ── Étape additionnelle (choriste uniquement) : après le mot de passe
-  // partagé, chaque choriste choisit son propre nom dans la liste afin
-  // que l'application sache qui consulte ses informations personnelles.
-  _renderIdentity(c) {
-    const membres = (Store.data.membres || [])
-      .filter(m => m.statut === 'Choriste' || m.statut === 'Intégrant')
-      .slice()
-      .sort((a, b) => a.nom.localeCompare(b.nom));
-
+  // ── 2 — Compte choriste individuel : matricule + mot de passe personnel.
+  // Remplace l'ancien système de sélection libre d'un nom dans une liste.
+  _renderChoristeLogin(c) {
+    if (LoginSecurity.isLocked()) {
+      this._renderLocked(c, 'Choriste');
+      return;
+    }
     c.innerHTML = this._shell(
-      'Qui êtes-vous ?',
-      'Sélectionnez votre nom dans la liste',
+      'Choriste',
+      'Connectez-vous à votre compte personnel',
       `
-        <div class="field" style="text-align:left;">
-          <input type="text" id="ps-identity-search" placeholder="Rechercher votre nom..." autocomplete="off">
-        </div>
-        <div id="ps-identity-list" style="display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto;text-align:left;">
-          ${membres.map(m => `
-            <button class="card" data-mid="${m.id}" style="display:flex;align-items:center;gap:10px;cursor:pointer;border:1px solid var(--line);width:100%;text-align:left;background:var(--paper);font-family:var(--font-body);color:var(--ink);padding:10px 12px;">
-              <span style="font-weight:600;">${Utils.escapeHtml(m.nom)}</span>
-              <span class="text-sm text-muted">${m.pupitre || ''}</span>
-            </button>
-          `).join('')}
-        </div>
+        <div id="ps-login-error" class="auth-error" style="display:none;"></div>
+        <form id="ps-choriste-form">
+          <div class="field" style="text-align:left;">
+            <label>Identifiant (matricule)</label>
+            <input type="text" id="ps-cl-matricule" autocomplete="off" placeholder="Ex: C012">
+          </div>
+          <div class="field" style="text-align:left;">
+            <label>Mot de passe</label>
+            <input type="password" id="ps-cl-pass" autocomplete="current-password" placeholder="••••••••">
+          </div>
+          <button type="submit" class="btn primary block mt-8">Se connecter</button>
+        </form>
+        <div class="text-sm text-muted mt-8">Votre identifiant vous a été communiqué par l'administration. Première connexion ? Entrez votre matricule, le mot de passe sera créé à l'étape suivante.</div>
       `,
       true
     );
 
-    const list = c.querySelector('#ps-identity-list');
-    const filterList = (q) => {
-      const qq = (q || '').toLowerCase();
-      list.querySelectorAll('[data-mid]').forEach(btn => {
-        const match = btn.textContent.toLowerCase().indexOf(qq) !== -1;
-        btn.style.display = match ? '' : 'none';
-      });
-    };
-    c.querySelector('#ps-identity-search').addEventListener('input', (e) => filterList(e.target.value));
+    c.querySelector('#ps-choriste-form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      this._submitChoristeLogin(c);
+    });
+    c.querySelector('#ps-back').addEventListener('click', (e) => {
+      e.preventDefault();
+      this.step = 'role';
+      this.render();
+    });
+  },
 
-    list.querySelectorAll('[data-mid]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        this.selection.choristeMembreId = btn.dataset.mid;
-        this._finish();
-      });
+  async _submitChoristeLogin(c) {
+    const matricule = c.querySelector('#ps-cl-matricule').value.trim();
+    const password = c.querySelector('#ps-cl-pass').value;
+    const errorEl = c.querySelector('#ps-login-error');
+    errorEl.style.display = 'none';
+
+    const membre = (Store.data.membres || []).find(m => m.id.toLowerCase() === matricule.toLowerCase() && (m.statut === 'Choriste' || m.statut === 'Intégrant'));
+    if (!membre) {
+      LoginSecurity.recordFailure();
+      this._showChoristeLoginError(c, errorEl);
+      return;
+    }
+
+    const compte = Store.getCompteChoriste(membre.id);
+    if (!compte || !compte.motDePasseHash) {
+      // Première connexion (ou mot de passe réinitialisé par l'Admin) :
+      // on passe directement à la création du mot de passe personnel.
+      this.selection.choristeMembreId = membre.id;
+      this.step = 'choriste-create';
+      this.render();
+      return;
+    }
+
+    if (compte.statutCompte === 'Désactivé') {
+      LoginSecurity.recordFailure();
+      errorEl.textContent = 'Ce compte est désactivé. Contactez un administrateur.';
+      errorEl.style.display = '';
+      return;
+    }
+
+    const ok = await Store.verifyChoristePassword(membre.id, password);
+    if (ok) {
+      LoginSecurity.recordSuccess();
+      Store.recordConnexionChoriste(membre.id);
+      this.selection.choristeMembreId = membre.id;
+      this._finish();
+    } else {
+      LoginSecurity.recordFailure();
+      this._showChoristeLoginError(c, errorEl);
+    }
+  },
+
+  _showChoristeLoginError(c, errorEl) {
+    if (LoginSecurity.isLocked()) {
+      this._renderLocked(c, 'Choriste');
+      return;
+    }
+    const left = LoginSecurity.attemptsLeft();
+    errorEl.textContent = `Identifiant ou mot de passe incorrect. ${left} tentative(s) restante(s) avant blocage temporaire.`;
+    errorEl.style.display = '';
+  },
+
+  // Création du mot de passe personnel (1ère connexion, ou après une
+  // réinitialisation effectuée par l'administrateur).
+  _renderChoristeCreate(c) {
+    const m = Store.getMembre(this.selection.choristeMembreId);
+    c.innerHTML = this._shell(
+      'Créer votre mot de passe',
+      m ? `Bienvenue ${m.nom} — définissez votre mot de passe personnel` : 'Définissez votre mot de passe personnel',
+      `
+        <div id="ps-create-error" class="auth-error" style="display:none;"></div>
+        <form id="ps-create-form">
+          <div class="field" style="text-align:left;">
+            <label>Nouveau mot de passe</label>
+            <input type="password" id="ps-cc-pass1" autocomplete="new-password" placeholder="Au moins 4 caractères">
+          </div>
+          <div class="field" style="text-align:left;">
+            <label>Confirmez le mot de passe</label>
+            <input type="password" id="ps-cc-pass2" autocomplete="new-password" placeholder="••••••••">
+          </div>
+          <button type="submit" class="btn primary block mt-8">Créer mon mot de passe</button>
+        </form>
+      `,
+      true
+    );
+
+    c.querySelector('#ps-create-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const p1 = c.querySelector('#ps-cc-pass1').value;
+      const p2 = c.querySelector('#ps-cc-pass2').value;
+      const errorEl = c.querySelector('#ps-create-error');
+      if (p1.length < 4) { errorEl.textContent = 'Le mot de passe doit contenir au moins 4 caractères.'; errorEl.style.display = ''; return; }
+      if (p1 !== p2) { errorEl.textContent = 'Les deux mots de passe ne correspondent pas.'; errorEl.style.display = ''; return; }
+      await Store.createCompteChoriste(this.selection.choristeMembreId, p1);
+      Store.recordConnexionChoriste(this.selection.choristeMembreId);
+      LoginSecurity.recordSuccess();
+      this._finish();
     });
 
     c.querySelector('#ps-back').addEventListener('click', (e) => {
       e.preventDefault();
-      this.step = 'role';
+      this.step = 'choriste-login';
       this.render();
     });
   },
@@ -2914,7 +3482,7 @@ const DashboardModule = {
     const year = d.meta.annee;
     let totalDue = 0, totalPaid = 0;
     membres.forEach(m => {
-      const due = Store.getCotisationDue(m) * 12;
+      const due = Store.getCotisationDueAnnuel(m, year);
       totalDue += due;
       for (let mo=1; mo<=12; mo++) {
         totalPaid += Store.getCotisation(m.id, `${year}-${String(mo).padStart(2,'0')}`);
@@ -3224,6 +3792,7 @@ const MembresModule = {
 
     main.innerHTML = `
       ${Permissions.readOnlyBanner()}
+      ${Permissions.isAdmin() ? this.renderDemandesBanner() : ''}
       <div class="search-bar">
         <span class="search-bar__icon">🔍</span>
         <input type="text" placeholder="Rechercher un membre..." id="member-search" value="${Utils.escapeHtml(this.filter.search)}">
@@ -3233,6 +3802,9 @@ const MembresModule = {
       </div>
       <div id="member-list"></div>
     `;
+
+    const demBtn = main.querySelector('#btn-open-demandes');
+    if (demBtn) demBtn.addEventListener('click', () => this.openDemandesAdmin());
 
     main.querySelectorAll('[data-statut]').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -3257,6 +3829,59 @@ const MembresModule = {
       main.appendChild(fab);
       fab.addEventListener('click', () => this.openMemberForm());
     }
+  },
+
+  // 7.6 — Bandeau Admin signalant les demandes de modification en attente.
+  renderDemandesBanner() {
+    const pending = Store.getDemandesModification({ statut: 'En attente' });
+    if (!pending.length) return '';
+    return `
+      <div class="alert-banner warn" id="btn-open-demandes" style="cursor:pointer;">
+        <div class="alert-banner__icon">📨</div>
+        <div><b>${pending.length} demande(s) de modification</b> en attente de validation — toucher pour examiner.</div>
+      </div>
+    `;
+  },
+
+  openDemandesAdmin() {
+    const pending = Store.getDemandesModification({ statut: 'En attente' });
+    if (!pending.length) { Utils.toast('Aucune demande en attente'); return; }
+    const html = `<div class="list">${pending.map(d => {
+      const m = Store.getMembre(d.membreId);
+      const champsHtml = Object.keys(d.champs).map(c => {
+        const ancienne = m ? (Array.isArray(m[c]) ? (m[c]||[]).join(', ') : (m[c]||'—')) : '—';
+        const nouvelle = Array.isArray(d.champs[c]) ? d.champs[c].join(', ') : d.champs[c];
+        return `<div style="padding:4px 0;font-size:0.85rem;"><b>${this.CHAMP_LABELS[c]||c}</b> : <span class="text-muted">${Utils.escapeHtml(String(ancienne))}</span> → <span style="color:var(--maroon);font-weight:600;">${Utils.escapeHtml(String(nouvelle))}</span></div>`;
+      }).join('');
+      return `
+        <div class="card" data-demid="${d.id}">
+          <div class="font-display" style="font-weight:700;">${m ? Utils.escapeHtml(m.nom) : d.membreId}</div>
+          <div class="text-sm text-muted">${Utils.fmtDate(d.dateDemande)}</div>
+          <div class="mt-8">${champsHtml}</div>
+          <div class="grid-2 mt-8">
+            <button class="btn danger block btn-refuser-dem" data-demid="${d.id}">❌ Refuser</button>
+            <button class="btn primary block btn-valider-dem" data-demid="${d.id}">✅ Valider</button>
+          </div>
+        </div>
+      `;
+    }).join('')}</div>`;
+    const sheet = Utils.openSheet('Demandes de modification', html);
+    sheet.querySelectorAll('.btn-valider-dem').forEach(btn => {
+      btn.addEventListener('click', () => {
+        Store.traiterDemandeModification(btn.dataset.demid, true);
+        Utils.closeSheet();
+        Utils.toast('Demande validée — fiche mise à jour');
+        Router.render();
+      });
+    });
+    sheet.querySelectorAll('.btn-refuser-dem').forEach(btn => {
+      btn.addEventListener('click', () => {
+        Store.traiterDemandeModification(btn.dataset.demid, false, "Refusée par l'administrateur");
+        Utils.closeSheet();
+        Utils.toast('Demande refusée');
+        Router.render();
+      });
+    });
   },
 
   // ── Choriste : affichage en ligne (pas de sheet) de sa propre fiche ──
@@ -3302,7 +3927,99 @@ const MembresModule = {
           </div>
           <div class="text-sm text-muted mt-8">${anniv.isToday ? "🎉 C'est aujourd'hui !" : `Dans ${anniv.daysRemaining} jour(s)`}</div>
         </div>` : ''}
+
+      <button class="btn secondary block" id="btn-demande-modif">✏️ Proposer une modification de mes informations</button>
+      <button class="btn secondary block mt-8" id="btn-changer-mdp">🔑 Changer mon mot de passe</button>
+
+      ${(() => {
+        const demandes = Store.getDemandesModification({ membreId: m.id });
+        if (!demandes.length) return '';
+        return `
+          <div class="section-title"><span class="ornament">📨</span> Mes demandes de modification</div>
+          <div class="list">${demandes.map(d => {
+            const cls = d.statut==='Validée'?'actif':d.statut==='Refusée'?'suspendu':'bureau';
+            const champsLabel = Object.keys(d.champs).map(c => this.CHAMP_LABELS[c]||c).join(', ');
+            return `<div class="list-row" style="cursor:default;"><div class="list-row__avatar">✏️</div><div class="list-row__body"><div class="list-row__title">${champsLabel}</div><div class="list-row__subtitle">${Utils.fmtDate(d.dateDemande)}${d.motifRefus?(' · '+Utils.escapeHtml(d.motifRefus)):''}</div></div><span class="pill ${cls}">${d.statut}</span></div>`;
+          }).join('')}</div>
+        `;
+      })()}
     `;
+
+    container.querySelector('#btn-demande-modif').addEventListener('click', () => this.openDemandeModificationForm(m));
+    container.querySelector('#btn-changer-mdp').addEventListener('click', () => this.openChangePasswordForm(m));
+  },
+
+  // 2 — Le choriste change lui-même son mot de passe (ancien requis).
+  openChangePasswordForm(m) {
+    const html = `
+      <div id="cp-error" class="auth-error" style="display:none;"></div>
+      <div class="field"><label>Mot de passe actuel</label><input type="password" id="cp-ancien" autocomplete="current-password"></div>
+      <div class="field"><label>Nouveau mot de passe</label><input type="password" id="cp-nouveau1" autocomplete="new-password" placeholder="Au moins 4 caractères"></div>
+      <div class="field"><label>Confirmez le nouveau mot de passe</label><input type="password" id="cp-nouveau2" autocomplete="new-password"></div>
+      <button class="btn primary block" id="cp-save">🔑 Mettre à jour mon mot de passe</button>
+    `;
+    const sheet = Utils.openSheet('Changer mon mot de passe', html);
+    sheet.querySelector('#cp-save').addEventListener('click', async () => {
+      const ancien = sheet.querySelector('#cp-ancien').value;
+      const n1 = sheet.querySelector('#cp-nouveau1').value;
+      const n2 = sheet.querySelector('#cp-nouveau2').value;
+      const errorEl = sheet.querySelector('#cp-error');
+      errorEl.style.display = 'none';
+      if (n1.length < 4) { errorEl.textContent = 'Le nouveau mot de passe doit contenir au moins 4 caractères.'; errorEl.style.display = ''; return; }
+      if (n1 !== n2) { errorEl.textContent = 'Les deux nouveaux mots de passe ne correspondent pas.'; errorEl.style.display = ''; return; }
+      const ok = await Store.changeChoristePassword(m.id, ancien, n1);
+      if (!ok) { errorEl.textContent = 'Mot de passe actuel incorrect.'; errorEl.style.display = ''; return; }
+      Utils.closeSheet();
+      Utils.toast('Mot de passe mis à jour');
+    });
+  },
+
+  CHAMP_LABELS: {
+    dateNaissance: 'Date de naissance',
+    telephone: 'Téléphone', adresse: 'Adresse', email: 'Email',
+    observations: 'Observations', jouesInstrument: 'Joue un instrument', instruments: 'Instrument(s)',
+  },
+
+  // 7.6 — Le choriste propose une modification ; rien n'est appliqué tant
+  // que l'Admin n'a pas validé via traiterDemandeModification().
+  openDemandeModificationForm(m) {
+    const instrumentsList = Array.isArray(m.instruments) ? m.instruments.join(', ') : '';
+    const html = `
+      <div class="alert-banner info"><div class="alert-banner__icon">ℹ️</div><div>Votre demande sera examinée par l'administrateur avant d'être appliquée à votre fiche.</div></div>
+      <div class="field"><label>Date de naissance</label><input type="date" id="dm-naissance" value="${m.dateNaissance||''}"></div>
+      <div class="field"><label>Téléphone</label><input type="text" id="dm-tel" value="${Utils.escapeHtml(m.telephone||'')}"></div>
+      <div class="field"><label>Adresse</label><input type="text" id="dm-adresse" value="${Utils.escapeHtml(m.adresse||'')}"></div>
+      <div class="field"><label>Email</label><input type="text" id="dm-email" value="${Utils.escapeHtml(m.email||'')}"></div>
+      <div class="field"><label>Observations</label><textarea id="dm-obs" rows="2">${Utils.escapeHtml(m.observations||'')}</textarea></div>
+      <div class="field"><label>Instrument(s) pratiqué(s) (séparés par une virgule)</label><input type="text" id="dm-instr" value="${Utils.escapeHtml(instrumentsList)}"></div>
+      <button class="btn primary block" id="dm-save">📨 Envoyer la demande</button>
+    `;
+    const sheet = Utils.openSheet('Proposer une modification', html);
+    sheet.querySelector('#dm-save').addEventListener('click', () => {
+      const champs = {};
+      const naissance = sheet.querySelector('#dm-naissance').value;
+      const tel = sheet.querySelector('#dm-tel').value.trim();
+      const adresse = sheet.querySelector('#dm-adresse').value.trim();
+      const email = sheet.querySelector('#dm-email').value.trim();
+      const obs = sheet.querySelector('#dm-obs').value.trim();
+      const instrRaw = sheet.querySelector('#dm-instr').value.trim();
+      if (naissance !== (m.dateNaissance||'')) champs.dateNaissance = naissance;
+      if (tel !== (m.telephone||'')) champs.telephone = tel;
+      if (adresse !== (m.adresse||'')) champs.adresse = adresse;
+      if (email !== (m.email||'')) champs.email = email;
+      if (obs !== (m.observations||'')) champs.observations = obs;
+      const instrArr = instrRaw ? instrRaw.split(',').map(s=>s.trim()).filter(Boolean) : [];
+      const currentInstr = Array.isArray(m.instruments) ? m.instruments : [];
+      if (JSON.stringify(instrArr) !== JSON.stringify(currentInstr)) {
+        champs.instruments = instrArr;
+        champs.jouesInstrument = instrArr.length ? 'Oui' : 'Non';
+      }
+      if (!Object.keys(champs).length) { Utils.toast('Aucune modification détectée'); return; }
+      Store.addDemandeModification({ id: Utils.genId('dem'), membreId: m.id, champs });
+      Utils.closeSheet();
+      Utils.toast('Demande envoyée — en attente de validation');
+      Router.render();
+    });
   },
 
   renderList(container) {
@@ -3392,6 +4109,47 @@ const MembresModule = {
           <div class="text-sm text-muted mt-8">${anniv.isToday ? "🎉 C'est aujourd'hui !" : `Dans ${anniv.daysRemaining} jour(s)`}</div>
         </div>` : ''}
 
+      ${(() => {
+        // 7.1 — Le test d'intégration reste consultable même après le passage
+        // au statut Choriste (la migration de l'identifiant est gérée par
+        // Store.migrateTestIntegration lors de l'admission).
+        const test = Store.getTestIntegration(m.id);
+        if (!test) return '';
+        const decClass = test.decision === 'Admis' ? 'actif' : test.decision === 'Admis sous réserve' ? 'derogation' : 'suspendu';
+        return `
+        <div class="section-title"><span class="ornament">📝</span> Test d'intégration</div>
+        <div class="card">
+          ${this.infoRow('Date du test', Utils.fmtDate(test.date))}
+          ${this.infoRow('Note obtenue', (test.moyenne!=null ? test.moyenne.toFixed(2) : '—') + '/20')}
+          ${test.observations ? this.infoRow('Observations du jury', test.observations) : ''}
+          <div class="flex-between mt-8"><span class="text-sm text-muted">Décision finale</span><span class="pill ${decClass}">${test.decision || '—'}</span></div>
+        </div>`;
+      })()}
+
+      ${(() => {
+        // 2 — Sécurité du compte choriste individuel (Admin uniquement).
+        if (!Permissions.isAdmin()) return '';
+        if (m.statut !== 'Choriste' && m.statut !== 'Intégrant') return '';
+        const compte = Store.getCompteChoriste(m.id);
+        const statutCompte = compte ? compte.statutCompte : 'Non créé';
+        const derniere = compte && compte.dernieresConnexions && compte.dernieresConnexions.length ? compte.dernieresConnexions[0] : null;
+        return `
+        <div class="section-title"><span class="ornament">🔐</span> Compte & sécurité</div>
+        <div class="card">
+          ${this.infoRow('Identifiant (matricule)', m.id)}
+          <div class="flex-between mt-8"><span class="text-sm text-muted">Statut du compte</span><span class="pill ${statutCompte==='Actif'?'actif':statutCompte==='Désactivé'?'suspendu':'bureau'}">${statutCompte}</span></div>
+          ${this.infoRow('Dernière connexion', derniere ? new Date(derniere).toLocaleString('fr-FR') : 'Jamais connecté')}
+          ${compte && compte.dernieresConnexions && compte.dernieresConnexions.length > 1 ? `
+            <details class="mt-8"><summary class="text-sm text-muted" style="cursor:pointer;">Historique des connexions (${compte.dernieresConnexions.length})</summary>
+              <div class="mt-8">${compte.dernieresConnexions.map(d => `<div class="text-sm" style="padding:3px 0;">${new Date(d).toLocaleString('fr-FR')}</div>`).join('')}</div>
+            </details>` : ''}
+        </div>
+        <div class="grid-2">
+          <button class="btn secondary block" id="btn-reset-mdp">♻️ Réinitialiser le mot de passe</button>
+          ${compte ? `<button class="btn ${statutCompte==='Désactivé'?'primary':'danger'} block" id="btn-toggle-compte">${statutCompte==='Désactivé'?'✅ Réactiver le compte':'🚫 Désactiver le compte'}</button>` : '<div></div>'}
+        </div>`;
+      })()}
+
       <div class="section-title"><span class="ornament">ℹ️</span> Informations</div>
       <div class="card">
         ${this.infoRow('Identifiant', m.id)}
@@ -3417,6 +4175,24 @@ const MembresModule = {
     const sheet = Utils.openSheet(`👤 ${m.nom}`, html);
     const editBtn = sheet.querySelector('#edit-member');
     const delBtn = sheet.querySelector('#delete-member');
+    const resetMdpBtn = sheet.querySelector('#btn-reset-mdp');
+    const toggleCompteBtn = sheet.querySelector('#btn-toggle-compte');
+    if (resetMdpBtn) resetMdpBtn.addEventListener('click', () => {
+      Utils.confirmAction(`Réinitialiser le mot de passe de <b>${Utils.escapeHtml(m.nom)}</b> ? Le membre devra en recréer un à sa prochaine connexion.`, () => {
+        Store.resetChoristePassword(m.id);
+        Utils.closeSheet();
+        Utils.toast('Mot de passe réinitialisé');
+        Router.render();
+      });
+    });
+    if (toggleCompteBtn) toggleCompteBtn.addEventListener('click', () => {
+      const compte = Store.getCompteChoriste(m.id);
+      const nouveauStatut = (compte && compte.statutCompte === 'Désactivé') ? 'Actif' : 'Désactivé';
+      Store.toggleCompteChoristeStatut(m.id, nouveauStatut);
+      Utils.closeSheet();
+      Utils.toast(`Compte ${nouveauStatut === 'Actif' ? 'réactivé' : 'désactivé'}`);
+      Router.render();
+    });
     if (editBtn) editBtn.addEventListener('click', () => {
       Utils.closeSheet();
       this.openMemberForm(m);
@@ -3463,9 +4239,24 @@ const MembresModule = {
           </select>
         </div>
       </div>
+      <div class="field" id="f-prise-fonction-wrap" style="display:${m.statut==='Bureau'?'':'none'};">
+        <label>Date de prise de fonction (Bureau)</label>
+        <input type="date" id="f-prise-fonction" value="${m.datePriseFonction || ''}">
+        <div class="text-sm text-muted" style="margin-top:4px;">Avant cette date : 250 FCFA/mois · à partir de cette date : 500 FCFA/mois.</div>
+      </div>
       <div class="field">
         <label>Fonction</label>
-        <input type="text" id="f-fonction" value="${Utils.escapeHtml(m.fonction)}" placeholder="Ex: Président, Choriste...">
+        <select id="f-fonction">
+          ${Utils.FONCTIONS.map(f => {
+            const isCustom = m.fonction && Utils.FONCTIONS.indexOf(m.fonction) === -1;
+            const selected = isCustom ? (f === 'Autre fonction') : (m.fonction === f);
+            return `<option value="${Utils.escapeHtml(f)}" ${selected?'selected':''}>${f}</option>`;
+          }).join('')}
+        </select>
+      </div>
+      <div class="field" id="f-fonction-autre-wrap" style="display:${(m.fonction && Utils.FONCTIONS.indexOf(m.fonction)===-1) || m.fonction==='Autre fonction' ?'':'none'};">
+        <label>Précisez la fonction</label>
+        <input type="text" id="f-fonction-autre" value="${Utils.escapeHtml((m.fonction && Utils.FONCTIONS.indexOf(m.fonction)===-1) ? m.fonction : '')}" placeholder="Ex: Chargé(e) de communication">
       </div>
       <div class="field">
         <label>Pupitre</label>
@@ -3530,6 +4321,16 @@ const MembresModule = {
     `;
 
     const sheet = Utils.openSheet(isEdit ? 'Modifier le membre' : 'Nouveau membre', html);
+    const statutSelect = sheet.querySelector('#f-statut');
+    const priseFonctionWrap = sheet.querySelector('#f-prise-fonction-wrap');
+    statutSelect.addEventListener('change', () => {
+      priseFonctionWrap.style.display = statutSelect.value === 'Bureau' ? '' : 'none';
+    });
+    const fonctionSelect = sheet.querySelector('#f-fonction');
+    const fonctionAutreWrap = sheet.querySelector('#f-fonction-autre-wrap');
+    fonctionSelect.addEventListener('change', () => {
+      fonctionAutreWrap.style.display = fonctionSelect.value === 'Autre fonction' ? '' : 'none';
+    });
     const joueSelect = sheet.querySelector('#f-joue-instrument');
     const instrWrap = sheet.querySelector('#f-instruments-wrap');
     joueSelect.addEventListener('change', () => {
@@ -3539,12 +4340,29 @@ const MembresModule = {
       const nom = sheet.querySelector('#f-nom').value.trim();
       if (!nom) { Utils.toast('Le nom est requis'); return; }
       const statut = sheet.querySelector('#f-statut').value;
+      if (statut === 'Bureau' && !sheet.querySelector('#f-prise-fonction').value) {
+        Utils.toast('La date de prise de fonction est obligatoire pour le Bureau');
+        return;
+      }
+      let fonction = fonctionSelect.value;
+      if (fonction === 'Autre fonction') {
+        const autre = sheet.querySelector('#f-fonction-autre').value.trim();
+        if (autre) fonction = autre;
+      }
       const jouesInstrument = joueSelect.value;
       let instruments = [];
       if (jouesInstrument === 'Oui') {
         instruments = Array.from(sheet.querySelectorAll('.f-instrument-cb:checked')).map(cb => cb.value);
         const autre = sheet.querySelector('#f-instrument-autre').value.trim();
         if (autre) instruments.push(autre);
+      }
+
+      // 1.A — si le statut passe manuellement d'Intégrant à autre chose et
+      // qu'aucune date d'intégration n'est encore enregistrée, on la fixe
+      // à aujourd'hui (aucune cotisation rétroactive).
+      let dateIntegration = m.dateIntegration || null;
+      if (m.statut === 'Intégrant' && statut !== 'Intégrant' && !dateIntegration) {
+        dateIntegration = Utils.todayISO();
       }
 
       const updated = {
@@ -3556,7 +4374,7 @@ const MembresModule = {
         telephone: sheet.querySelector('#f-tel').value,
         adresse: sheet.querySelector('#f-adresse').value,
         pupitre: sheet.querySelector('#f-pupitre').value,
-        fonction: sheet.querySelector('#f-fonction').value,
+        fonction,
         statut,
         dateEntree: sheet.querySelector('#f-entree').value,
         situation: sheet.querySelector('#f-situation').value,
@@ -3564,6 +4382,8 @@ const MembresModule = {
         observations: sheet.querySelector('#f-obs').value,
         jouesInstrument,
         instruments,
+        datePriseFonction: statut === 'Bureau' ? sheet.querySelector('#f-prise-fonction').value : (m.datePriseFonction || null),
+        dateIntegration,
       };
 
       Store.upsertMembre(updated);
@@ -3595,6 +4415,7 @@ const DisciplineModule = {
       { key: 'indicateurs', label: '🎯 Indicateurs' },
       { key: 'sanctions', label: '💸 Sanctions' },
       { key: 'derogations', label: '🔓 Dérogations' },
+      { key: 'toges', label: '👘 Toges' },
     ];
 
     main.innerHTML = `
@@ -3617,6 +4438,7 @@ const DisciplineModule = {
     else if (this.tab === 'stats') this.renderStats(content);
     else if (this.tab === 'indicateurs') this.renderIndicateurs(content, main);
     else if (this.tab === 'sanctions') this.renderSanctions(content, main);
+    else if (this.tab === 'toges') this.renderToges(content, main);
     else this.renderDerogations(content, main);
   },
 
@@ -3664,7 +4486,269 @@ const DisciplineModule = {
         </div>
       `;
       }).join('')}</div>` : `<div class="empty-state"><div class="empty-state__icon">✅</div><div class="empty-state__text">Aucune sanction</div></div>`}
+
+      <div class="section-title"><span class="ornament">👘</span> Ma toge</div>
+      ${(() => {
+        const toge = Store.getToges().find(t => t.attribueA === me.id);
+        if (!toge) return `<div class="empty-state"><div class="empty-state__icon">👘</div><div class="empty-state__text">Aucune toge attribuée pour le moment</div></div>`;
+        return `<div class="card">
+          ${this.infoRowToge('Type', toge.type)}
+          ${this.infoRowToge('Code', toge.code)}
+          ${this.infoRowToge('État', toge.etat)}
+          ${toge.dateAttribution ? this.infoRowToge('Date attribution', Utils.fmtDate(toge.dateAttribution)) : ''}
+        </div>`;
+      })()}
     `;
+  },
+
+  // ── GESTION DES TOGES ──
+  togesSubTab: 'dashboard',
+
+  renderToges(container, main) {
+    const canManage = Permissions.canManageData('discipline');
+    const subTabs = [
+      { key: 'dashboard', label: '📊 Tableau de bord' },
+      { key: 'stock', label: '📦 Types & Stock' },
+      { key: 'attribution', label: '🙋 Attribution' },
+      { key: 'historique', label: '📜 Historique' },
+    ];
+    container.innerHTML = `
+      <div class="tabbar">${subTabs.map(t=>`<button class="tab-btn ${this.togesSubTab===t.key?'active':''}" data-ttab="${t.key}">${t.label}</button>`).join('')}</div>
+      <div id="toges-sub-content"></div>
+    `;
+    container.querySelectorAll('[data-ttab]').forEach(btn => {
+      btn.addEventListener('click', () => { this.togesSubTab = btn.dataset.ttab; this.renderToges(container, main); });
+    });
+    const sub = container.querySelector('#toges-sub-content');
+    if (this.togesSubTab === 'stock') this.renderTogesStock(sub, canManage);
+    else if (this.togesSubTab === 'attribution') this.renderTogesAttribution(sub, canManage);
+    else if (this.togesSubTab === 'historique') this.renderTogesHistorique(sub);
+    else this.renderTogesDashboard(sub, canManage);
+  },
+
+  // 4 — Tableau de bord Toges
+  renderTogesDashboard(container, canManage) {
+    const stats = Store.getTogesStats();
+    const alertes = Store.getTogesAlertes();
+    container.innerHTML = `
+      <div class="grid-2">
+        <div class="card center"><div class="text-sm text-muted">Total toges</div><div class="font-display" style="font-size:1.3rem;font-weight:700;color:var(--maroon);">${stats.total}</div></div>
+        <div class="card center"><div class="text-sm text-muted">Disponibles</div><div class="font-display" style="font-size:1.3rem;font-weight:700;color:var(--green);">${stats.disponibles}</div></div>
+      </div>
+      <div class="grid-2">
+        <div class="card center"><div class="text-sm text-muted">Attribuées</div><div class="font-display" style="font-size:1.3rem;font-weight:700;">${stats.attribuees}</div></div>
+        <div class="card center"><div class="text-sm text-muted">En réparation</div><div class="font-display" style="font-size:1.3rem;font-weight:700;color:var(--amber);">${stats.reparation}</div></div>
+      </div>
+      <div class="grid-2">
+        <div class="card center"><div class="text-sm text-muted">Mauvais état</div><div class="font-display" style="font-size:1.3rem;font-weight:700;color:var(--red);">${stats.mauvaisEtat}</div></div>
+        <div class="card center"><div class="text-sm text-muted">Choristes sans toge</div><div class="font-display" style="font-size:1.3rem;font-weight:700;color:var(--red);">${stats.sansToge.length}</div></div>
+      </div>
+      ${alertes.length ? `
+        <div class="section-title"><span class="ornament">⚠️</span> Alertes</div>
+        ${alertes.map(a => `<div class="alert-banner ${a.type==='dechiree'||a.type==='hs'?'danger':'warn'}"><div class="alert-banner__icon">⚠️</div><div>${Utils.escapeHtml(a.message)}</div></div>`).join('')}
+      ` : `<div class="alert-banner success"><div class="alert-banner__icon">✅</div><div>Aucune alerte sur le stock de toges.</div></div>`}
+
+      <div class="section-title"><span class="ornament">📤</span> Rapports & exports</div>
+      <button class="btn secondary block" id="exp-toges-inventaire">📦 Inventaire complet (Excel)</button>
+      <button class="btn secondary block mt-8" id="exp-toges-avec">🙋 Choristes avec toge (Excel)</button>
+      <button class="btn secondary block mt-8" id="exp-toges-sans">🙅 Choristes sans toge (Excel)</button>
+      <button class="btn secondary block mt-8" id="exp-toges-historique">📜 Historique complet (Excel)</button>
+    `;
+    container.querySelector('#exp-toges-inventaire').addEventListener('click', () => {
+      const rows = Store.getToges().map(t => [t.type, t.code, t.etat, t.attribueA ? (Store.getMembre(t.attribueA)||{}).nom||'' : '', t.dateAttribution||'', t.observations||'']);
+      Utils.exportCSV('toges_inventaire', ['Type','Code','État','Attribuée à','Date attribution','Observations'], rows);
+    });
+    container.querySelector('#exp-toges-avec').addEventListener('click', () => {
+      const rows = stats.avecToge.map(m => {
+        const t = Store.getToges().find(t=>t.attribueA===m.id);
+        return [m.nom, m.statut, t?t.type:'', t?t.code:'', t?t.dateAttribution:''];
+      });
+      Utils.exportCSV('choristes_avec_toge', ['Nom','Statut','Type toge','Code','Date attribution'], rows);
+    });
+    container.querySelector('#exp-toges-sans').addEventListener('click', () => {
+      const rows = stats.sansToge.map(m => [m.nom, m.statut, m.pupitre||'']);
+      Utils.exportCSV('choristes_sans_toge', ['Nom','Statut','Pupitre'], rows);
+    });
+    container.querySelector('#exp-toges-historique').addEventListener('click', () => {
+      const rows = [];
+      Store.getToges().forEach(t => (t.historique||[]).forEach(h => rows.push([t.type, t.code, h.date, h.action, h.par||''])));
+      rows.sort((a,b)=>b[2].localeCompare(a[2]));
+      Utils.exportCSV('toges_historique', ['Type','Code','Date','Action','Par'], rows);
+    });
+  },
+
+  // 1 — Types & Stock
+  renderTogesStock(container, canManage) {
+    const stats = Store.getTogesStats();
+    const types = Store.getTypesToges();
+    container.innerHTML = `
+      <div class="card"><div class="flex-between"><span class="text-sm text-muted">Total général</span><span style="font-weight:700;font-size:1.1rem;">${stats.total}</span></div></div>
+      ${types.map(type => {
+        const s = stats.parType[type] || { total:0,bonEtat:0,usees:0,dechirees:0,reparation:0,disponibles:0,attribuees:0 };
+        return `
+        <div class="section-title"><span class="ornament">👘</span> ${type}</div>
+        <div class="card">
+          ${DisciplineModule.infoRowToge('Nombre total', s.total)}
+          ${DisciplineModule.infoRowToge('En bon état', s.bonEtat)}
+          ${DisciplineModule.infoRowToge('Usées', s.usees)}
+          ${DisciplineModule.infoRowToge('Déchirées', s.dechirees)}
+          ${DisciplineModule.infoRowToge('En réparation', s.reparation)}
+          ${DisciplineModule.infoRowToge('Disponibles', s.disponibles)}
+          ${DisciplineModule.infoRowToge('Attribuées', s.attribuees)}
+        </div>`;
+      }).join('')}
+
+      ${canManage ? `
+      <button class="btn secondary block mt-16" id="btn-add-type-toge">➕ Ajouter un type de toge</button>
+      <div class="section-title"><span class="ornament">👕</span> Inventaire détaillé</div>
+      <button class="btn primary block" id="btn-add-toge">➕ Ajouter une toge au stock</button>
+      ` : ''}
+      <div class="list mt-16">${Store.getToges().map(t => {
+        const etatClass = t.etat==='Disponible'||t.etat==='Utilisée' ? 'actif' : t.etat==='En réparation' ? 'derogation' : 'suspendu';
+        return `
+        <div class="list-row" data-id="${t.id}">
+          <div class="list-row__avatar">👘</div>
+          <div class="list-row__body"><div class="list-row__title">${t.type} — ${Utils.escapeHtml(t.code)}</div><div class="list-row__subtitle">${t.attribueA ? ('Attribuée à '+((Store.getMembre(t.attribueA)||{}).nom||'?')) : 'Non attribuée'}</div></div>
+          <span class="pill ${etatClass}">${t.etat}</span>
+        </div>`;
+      }).join('')}</div>
+    `;
+    if (canManage) {
+      container.querySelector('#btn-add-type-toge').addEventListener('click', () => {
+        const nom = prompt('Nom du nouveau type de toge :');
+        if (nom && nom.trim()) { Store.addTypeToge(nom.trim()); Utils.toast('Type ajouté'); Router.render(); }
+      });
+      container.querySelector('#btn-add-toge').addEventListener('click', () => this.openTogeForm());
+    }
+    container.querySelectorAll('[data-id]').forEach(row => {
+      row.addEventListener('click', () => this.openTogeDetail(row.dataset.id, canManage));
+    });
+  },
+
+  infoRowToge(label, value) {
+    return `<div class="flex-between" style="padding:4px 0;border-bottom:1px solid var(--line);"><span class="text-sm text-muted">${label}</span><span style="font-weight:700;">${value}</span></div>`;
+  },
+
+  openTogeForm() {
+    const types = Store.getTypesToges();
+    const html = `
+      <div class="field"><label>Type</label><select id="tf-type">${types.map(t=>`<option value="${t}">${t}</option>`).join('')}</select></div>
+      <div class="field"><label>Numéro / Code</label><input type="text" id="tf-code" placeholder="Ex: TV-001"></div>
+      <div class="field"><label>État</label><select id="tf-etat">${Store.TOGE_ETATS.map(e=>`<option value="${e}">${e}</option>`).join('')}</select></div>
+      <button class="btn primary block" id="tf-save">💾 Ajouter au stock</button>
+    `;
+    const sheet = Utils.openSheet('Nouvelle toge', html);
+    sheet.querySelector('#tf-save').addEventListener('click', () => {
+      const code = sheet.querySelector('#tf-code').value.trim();
+      if (!code) { Utils.toast('Le code est requis'); return; }
+      Store.addToge({ id: Utils.genId('toge'), type: sheet.querySelector('#tf-type').value, code, etat: sheet.querySelector('#tf-etat').value, attribueA: null, dateAttribution: null, observations: '' });
+      Utils.closeSheet();
+      Utils.toast('Toge ajoutée au stock');
+      Router.render();
+    });
+  },
+
+  openTogeDetail(id, canManage) {
+    const t = Store.getToge(id);
+    if (!t) return;
+    const membre = t.attribueA ? Store.getMembre(t.attribueA) : null;
+    const hist = t.historique || [];
+    const html = `
+      <div class="card">
+        ${this.infoRowToge('Type', t.type)}
+        ${this.infoRowToge('Code', t.code)}
+        ${this.infoRowToge('Attribuée à', membre ? membre.nom : 'Personne')}
+        ${t.dateAttribution ? this.infoRowToge('Date attribution', Utils.fmtDate(t.dateAttribution)) : ''}
+        ${t.observations ? this.infoRowToge('Observations', t.observations) : ''}
+      </div>
+      ${canManage ? `
+      <div class="field"><label>État</label><select id="td-etat">${Store.TOGE_ETATS.map(e=>`<option value="${e}" ${t.etat===e?'selected':''}>${e}</option>`).join('')}</select></div>
+      <button class="btn secondary block" id="td-save-etat">✏️ Mettre à jour l'état</button>
+      ${t.attribueA ? '<button class="btn danger block mt-8" id="td-restituer">↩️ Restituer cette toge</button>' : ''}
+      ` : ''}
+      ${hist.length ? `
+        <div class="section-title"><span class="ornament">📜</span> Historique</div>
+        <div class="card">${hist.slice().reverse().map(h => `<div style="padding:5px 0;border-bottom:1px solid var(--line);font-size:0.82rem;"><span class="text-muted">${Utils.fmtDate(h.date)}</span> — ${Utils.escapeHtml(h.action)}${h.par?(' <span class="text-muted">('+h.par+')</span>'):''}</div>`).join('')}</div>
+      ` : ''}
+    `;
+    const sheet = Utils.openSheet(`${t.type} — ${t.code}`, html);
+    const saveEtatBtn = sheet.querySelector('#td-save-etat');
+    if (saveEtatBtn) saveEtatBtn.addEventListener('click', () => {
+      const nv = sheet.querySelector('#td-etat').value;
+      Store.changerEtatToge(id, nv);
+      Utils.closeSheet();
+      Utils.toast('État mis à jour');
+      Router.render();
+    });
+    const restituerBtn = sheet.querySelector('#td-restituer');
+    if (restituerBtn) restituerBtn.addEventListener('click', () => {
+      Utils.confirmAction('Restituer cette toge ? Elle redeviendra disponible.', () => {
+        Store.restituerToge(id);
+        Utils.closeSheet();
+        Utils.toast('Toge restituée');
+        Router.render();
+      });
+    });
+  },
+
+  // 2 — Attribution aux choristes
+  renderTogesAttribution(container, canManage) {
+    const stats = Store.getTogesStats();
+    container.innerHTML = `
+      <div class="section-title"><span class="ornament">🙋</span> Choristes avec toge (${stats.avecToge.length})</div>
+      <div class="list">${stats.avecToge.map(m => {
+        const t = Store.getToges().find(t=>t.attribueA===m.id);
+        return `<div class="list-row" style="cursor:default;"><div class="list-row__avatar">${Utils.initials(m.nom)}</div><div class="list-row__body"><div class="list-row__title">${Utils.escapeHtml(m.nom)}</div><div class="list-row__subtitle">${t?(t.type+' — '+t.code):''} ${t&&t.dateAttribution?(' · '+Utils.fmtDate(t.dateAttribution)):''}</div></div></div>`;
+      }).join('') || '<div class="text-sm text-muted">Aucun</div>'}</div>
+
+      <div class="section-title"><span class="ornament">🙅</span> Choristes sans toge (${stats.sansToge.length})</div>
+      <div class="list">${stats.sansToge.map(m => `
+        <div class="list-row" ${canManage?`data-attribuer="${m.id}"`:''} style="${canManage?'cursor:pointer;':'cursor:default;'}">
+          <div class="list-row__avatar">${Utils.initials(m.nom)}</div>
+          <div class="list-row__body"><div class="list-row__title">${Utils.escapeHtml(m.nom)}</div><div class="list-row__subtitle">${m.statut}${m.pupitre?(' · '+m.pupitre):''}</div></div>
+          ${canManage ? '<span class="list-row__chevron">›</span>' : ''}
+        </div>
+      `).join('') || '<div class="text-sm text-muted">Tous les choristes ont une toge 🎉</div>'}</div>
+    `;
+    if (canManage) {
+      container.querySelectorAll('[data-attribuer]').forEach(row => {
+        row.addEventListener('click', () => this.openAttribuerTogeForm(row.dataset.attribuer));
+      });
+    }
+  },
+
+  openAttribuerTogeForm(membreId) {
+    const m = Store.getMembre(membreId);
+    const disponibles = Store.getToges({ attribuee: false }).filter(t => t.etat === 'Disponible');
+    if (!disponibles.length) { Utils.toast('Aucune toge disponible — ajoutez-en au stock'); return; }
+    const html = `
+      <div class="field"><label>Toge à attribuer à ${Utils.escapeHtml(m.nom)}</label>
+        <select id="at-toge">${disponibles.map(t=>`<option value="${t.id}">${t.type} — ${t.code}</option>`).join('')}</select>
+      </div>
+      <div class="field"><label>Observations</label><textarea id="at-obs" rows="2"></textarea></div>
+      <button class="btn primary block" id="at-save">✅ Attribuer</button>
+    `;
+    const sheet = Utils.openSheet('Attribution de toge', html);
+    sheet.querySelector('#at-save').addEventListener('click', () => {
+      Store.attribuerToge(sheet.querySelector('#at-toge').value, membreId, sheet.querySelector('#at-obs').value);
+      Utils.closeSheet();
+      Utils.toast('Toge attribuée');
+      Router.render();
+    });
+  },
+
+  // 5 — Historique complet des mouvements
+  renderTogesHistorique(container) {
+    const rows = [];
+    Store.getToges().forEach(t => (t.historique||[]).forEach(h => rows.push({ ...h, type: t.type, code: t.code })));
+    rows.sort((a,b)=>b.date.localeCompare(a.date));
+    container.innerHTML = rows.length ? `<div class="list">${rows.map(h => `
+      <div class="list-row" style="cursor:default;">
+        <div class="list-row__avatar">📜</div>
+        <div class="list-row__body"><div class="list-row__title">${h.type} — ${Utils.escapeHtml(h.code)}</div><div class="list-row__subtitle">${Utils.escapeHtml(h.action)}${h.par?(' · '+h.par):''}</div></div>
+        <div class="text-sm text-muted">${Utils.fmtDate(h.date)}</div>
+      </div>
+    `).join('')}</div>` : `<div class="empty-state"><div class="empty-state__icon">📜</div><div class="empty-state__text">Aucun mouvement enregistré</div></div>`;
   },
 
   // ── POINTAGE ──
@@ -4310,7 +5394,7 @@ const TresorerieModule = {
     // Stats globales rapides
     let totalDue=0, totalPaid=0, aJour=0, retardLeger=0, retardImportant=0;
     membres.forEach(m => {
-      const due = Store.getCotisationDue(m)*12;
+      const due = Store.getCotisationDueAnnuel(m, year);
       let paid=0;
       for(let mo=1;mo<=12;mo++) paid+=Store.getCotisation(m.id,`${year}-${String(mo).padStart(2,'0')}`);
       totalDue+=due; totalPaid+=paid;
@@ -4332,7 +5416,7 @@ const TresorerieModule = {
 
     const listEl = container.querySelector('#individuel-list');
     listEl.innerHTML = membres.map(m => {
-      const due = Store.getCotisationDue(m)*12;
+      const due = Store.getCotisationDueAnnuel(m, year);
       let paid=0;
       for(let mo=1;mo<=12;mo++) paid+=Store.getCotisation(m.id,`${year}-${String(mo).padStart(2,'0')}`);
       const pct = due>0?paid/due:1;
@@ -4361,7 +5445,7 @@ const TresorerieModule = {
   openFicheIndividuelle(membreId, isManager) {
     const m = Store.getMembre(membreId); if(!m) return;
     const year = Store.data.meta.annee;
-    const due12 = Store.getCotisationDue(m)*12;
+    const due12 = Store.getCotisationDueAnnuel(m, year);
     let paid12=0;
     const monthDetails = [];
     for(let mo=1;mo<=12;mo++){
@@ -5097,7 +6181,7 @@ const TresorerieModule = {
       const key = `${year}-${String(mo).padStart(2,'0')}`;
       let due=0, paid=0;
       membres.forEach(m => {
-        due += Store.getCotisationDue(m);
+        due += Store.getCotisationDue(m, key);
         paid += Store.getCotisation(m.id, key);
       });
       totalAttendu += due; totalEncaisse += paid;
@@ -5189,7 +6273,22 @@ const TresorerieModule = {
           </tbody>
         </table>
       </div>
+
+      <button class="btn secondary block mt-16" id="exp-treso-excel">📤 Exporter le bilan (Excel)</button>
     `;
+
+    const expTresoBtn = container.querySelector('#exp-treso-excel');
+    if (expTresoBtn) {
+      expTresoBtn.addEventListener('click', () => {
+        const rows = Store.data.membres.map(m => {
+          const due = Store.getCotisationDueAnnuel(m, year);
+          let paid = 0;
+          for (let mo=1; mo<=12; mo++) paid += Store.getCotisation(m.id, `${year}-${String(mo).padStart(2,'0')}`);
+          return [m.nom, m.statut, due, paid, Math.max(0, due-paid)];
+        });
+        Utils.exportCSV(`tresorerie_bilan_${year}`, ['Nom','Statut','Dû annuel','Payé','Reste'], rows);
+      });
+    }
 
     const editSoldeBtn = container.querySelector('#edit-solde-reporte');
     if (editSoldeBtn) {
@@ -5384,7 +6483,12 @@ const SecretariatModule = {
         </div>
       </div>
       <div id="activite-list"></div>
+      <button class="btn secondary block mt-16" id="exp-activites-excel">📤 Exporter les activités (Excel)</button>
     `;
+    container.querySelector('#exp-activites-excel').addEventListener('click', () => {
+      const rows = activites.map(a => [a.type||'', a.date||'', a.statut||'', a.lieu||'', a.responsable||'', a.objectifs||'']);
+      Utils.exportCSV('secretariat_activites', ['Type','Date','Statut','Lieu','Responsable','Objectifs'], rows);
+    });
 
     if (!activites.length) {
       container.querySelector('#activite-list').innerHTML = `<div class="empty-state"><div class="empty-state__icon">📅</div><div class="empty-state__text">Aucune activité enregistrée</div></div>`;
@@ -5552,10 +6656,10 @@ const SecretariatModule = {
     });
   },
 
-  // ── MODÉRATEURS ──
+  // ── MODÉRATEURS (tous les membres : Intégrants, Choristes, Bureau) ──
   renderModerateurs(container, main) {
     const moderations = Store.getModerations();
-    const choristes = Store.data.membres.filter(m=>m.statut==='Choriste').sort((a,b)=>a.nom.localeCompare(b.nom));
+    const choristes = Store.data.membres.slice().sort((a,b)=>a.nom.localeCompare(b.nom));
 
     // Count per choriste
     const counts = {};
@@ -5778,7 +6882,9 @@ const DirectionModule = {
       { key: 'evaluations', label: '⭐ Évaluations' },
       { key: 'repertoire', label: '🎵 Répertoire' },
       { key: 'integrants', label: '🔍 Intégrants' },
-    ].filter(t => !Permissions.choristeRestricted() || t.key === 'repertoire');
+      { key: 'instrumentistes', label: '🎻 Instrumentistes' },
+    ].filter(t => !Permissions.choristeRestricted() || t.key === 'repertoire')
+     .filter(t => t.key !== 'instrumentistes' || Permissions.canManageData('direction') || Permissions.isAdmin());
 
     // Le choriste n'a accès qu'au Répertoire : on force l'onglet actif.
     if (Permissions.choristeRestricted()) this.tab = 'repertoire';
@@ -5798,12 +6904,13 @@ const DirectionModule = {
     const content = main.querySelector('#dt-content');
     if (this.tab === 'evaluations') this.renderEvaluations(content);
     else if (this.tab === 'repertoire') this.renderRepertoire(content, main);
+    else if (this.tab === 'instrumentistes') this.renderInstrumentistes(content, main);
     else this.renderIntegrants(content);
   },
 
-  // ── ÉVALUATIONS MUSICALES ──
+  // ── ÉVALUATIONS MUSICALES (tous les membres : Intégrants, Choristes, Bureau) ──
   renderEvaluations(container) {
-    const choristes = Store.data.membres.filter(m=>m.statut==='Choriste').sort((a,b)=>a.nom.localeCompare(b.nom));
+    const choristes = Store.data.membres.slice().sort((a,b)=>a.nom.localeCompare(b.nom));
 
     let sumMoy = 0, count = 0;
     const rows = choristes.map(m => {
@@ -5831,7 +6938,7 @@ const DirectionModule = {
               <div class="list-row__avatar">${Utils.initials(r.membre.nom)}</div>
               <div class="list-row__body">
                 <div class="list-row__title">${Utils.escapeHtml(r.membre.nom)}</div>
-                <div class="list-row__subtitle">${r.membre.pupitre || '—'}</div>
+                <div class="list-row__subtitle">${r.membre.pupitre || '—'} · <span class="text-sm">${r.membre.statut}</span></div>
               </div>
               <div class="list-row__meta">
                 <div style="font-weight:700;font-size:1rem;">${r.moy.toFixed(1)}/20</div>
@@ -5872,11 +6979,26 @@ const DirectionModule = {
           </div>
         `;
       }).join('')}
+      ${m.jouesInstrument === 'Oui' ? `
+      <div class="field">
+        <label>🎻 Niveau de maîtrise musicale (instrument)</label>
+        <select id="eval-niveau">
+          ${['Débutant','Intermédiaire','Avancé','Expert'].map(n => `<option value="${n}" ${ev.niveauMaitrise===n?'selected':''}>${n}</option>`).join('')}
+        </select>
+      </div>` : ''}
       <div class="card center mt-8">
         <div class="text-sm text-muted">Moyenne</div>
         <div class="font-display" id="eval-avg" style="font-size:1.5rem;font-weight:700;color:var(--maroon);">0.0/20</div>
       </div>
       <button class="btn primary block mt-16" id="save-eval">💾 Enregistrer l'évaluation</button>
+      ${(ev.historique && ev.historique.length > 1) ? `
+        <div class="section-title"><span class="ornament">📜</span> Historique des évaluations</div>
+        <div class="card">${ev.historique.slice().reverse().map(h => `
+          <div style="padding:5px 0;border-bottom:1px solid var(--line);font-size:0.82rem;">
+            <span class="text-muted">${Utils.fmtDate(h.date)}</span>
+            ${h.niveauMaitrise ? ` · Niveau : <b>${h.niveauMaitrise}</b>` : ''}
+          </div>
+        `).join('')}</div>` : ''}
     `;
 
     const sheet = Utils.openSheet(`⭐ ${m.nom}`, html);
@@ -5900,10 +7022,213 @@ const DirectionModule = {
     sheet.querySelector('#save-eval').addEventListener('click', () => {
       const notes = {};
       sheet.querySelectorAll('[data-crit]').forEach(s => { notes[s.dataset.crit] = Number(s.value); });
-      Store.setEvaluation(membreId, { notes, date: Utils.todayISO() });
+      const niveauSelect = sheet.querySelector('#eval-niveau');
+      const evalData = { notes, date: Utils.todayISO() };
+      if (niveauSelect) evalData.niveauMaitrise = niveauSelect.value;
+      Store.setEvaluation(membreId, evalData);
       Utils.closeSheet();
       Utils.toast('Évaluation enregistrée');
       Router.render();
+    });
+  },
+
+  // ── INSTRUMENTISTES (sous-module Musique — Direction Technique / Admin) ──
+  instrSubTab: 'fiches',
+
+  renderInstrumentistes(container, main) {
+    const subTabs = [
+      { key: 'fiches', label: '🎻 Fiches' },
+      { key: 'repetitions', label: '🗓️ Répétitions' },
+    ];
+    container.innerHTML = `
+      <div class="tabbar">${subTabs.map(t => `<button class="tab-btn ${this.instrSubTab===t.key?'active':''}" data-itab="${t.key}">${t.label}</button>`).join('')}</div>
+      <div id="instr-sub-content"></div>
+    `;
+    container.querySelectorAll('[data-itab]').forEach(btn => {
+      btn.addEventListener('click', () => { this.instrSubTab = btn.dataset.itab; this.renderInstrumentistes(container, main); });
+    });
+    const sub = container.querySelector('#instr-sub-content');
+    if (this.instrSubTab === 'repetitions') this.renderRepetitionsInstrumentales(sub, main);
+    else this.renderFichesInstrumentistes(sub, main);
+  },
+
+  INSTRUMENTS_OPTIONS: ['Piano','Guitare','Basse','Batterie','Violon','Saxophone','Trompette','Flûte','Orgue','Autre'],
+
+  renderFichesInstrumentistes(container, main) {
+    const fiches = Store.getInstrumentistes();
+    container.innerHTML = `
+      ${fiches.length ? `<div class="list">${fiches.map(f => `
+        <div class="list-row" data-id="${f.id}">
+          <div class="list-row__avatar">🎻</div>
+          <div class="list-row__body">
+            <div class="list-row__title">${Utils.escapeHtml(f.nom)}</div>
+            <div class="list-row__subtitle">${f.instrumentPrincipal}${f.niveauMusical?(' · '+f.niveauMusical):''}</div>
+          </div>
+          <span class="list-row__chevron">›</span>
+        </div>
+      `).join('')}</div>` : `<div class="empty-state"><div class="empty-state__icon">🎻</div><div class="empty-state__text">Aucun instrumentiste enregistré</div></div>`}
+      <button class="btn primary block mt-16" id="btn-add-instrumentiste">➕ Nouvelle fiche instrumentiste</button>
+    `;
+    container.querySelector('#btn-add-instrumentiste').addEventListener('click', () => this.openInstrumentisteForm());
+    container.querySelectorAll('[data-id]').forEach(row => {
+      row.addEventListener('click', () => this.openInstrumentisteForm(Store.getInstrumentiste(row.dataset.id)));
+    });
+  },
+
+  openInstrumentisteForm(fiche) {
+    const f = fiche || { id: Utils.genId('instr'), nom: '', instrumentPrincipal: 'Piano', instrumentsSecondaires: [], niveauMusical: 'Débutant', dateEntree: Utils.todayISO(), observations: '' };
+    const membresInstrumentistes = Store.data.membres.filter(m => m.jouesInstrument === 'Oui');
+    const html = `
+      <div class="field">
+        <label>Nom</label>
+        <input type="text" id="if-nom" list="if-nom-list" value="${Utils.escapeHtml(f.nom)}">
+        <datalist id="if-nom-list">${membresInstrumentistes.map(m=>`<option value="${Utils.escapeHtml(m.nom)}">`).join('')}</datalist>
+      </div>
+      <div class="field">
+        <label>Instrument principal</label>
+        <select id="if-principal">${this.INSTRUMENTS_OPTIONS.map(i=>`<option value="${i}" ${f.instrumentPrincipal===i?'selected':''}>${i}</option>`).join('')}</select>
+      </div>
+      <div class="field">
+        <label>Instruments secondaires</label>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;">
+          ${this.INSTRUMENTS_OPTIONS.map(i => `<label style="display:flex;align-items:center;gap:4px;font-weight:400;font-size:0.85rem;"><input type="checkbox" class="if-secondaire-cb" value="${i}" ${(f.instrumentsSecondaires||[]).indexOf(i)!==-1?'checked':''} style="width:auto;"> ${i}</label>`).join('')}
+        </div>
+      </div>
+      <div class="field">
+        <label>Niveau musical</label>
+        <select id="if-niveau">${['Débutant','Intermédiaire','Avancé','Expert'].map(n=>`<option value="${n}" ${f.niveauMusical===n?'selected':''}>${n}</option>`).join('')}</select>
+      </div>
+      <div class="field"><label>Date d'entrée</label><input type="date" id="if-date" value="${f.dateEntree||''}"></div>
+      <div class="field"><label>Observations</label><textarea id="if-obs" rows="2">${Utils.escapeHtml(f.observations||'')}</textarea></div>
+      <div class="grid-2 mt-16">
+        ${fiche ? '<button class="btn danger block" id="if-del">🗑️ Supprimer</button>' : '<div></div>'}
+        <button class="btn primary block" id="if-save">💾 Enregistrer</button>
+      </div>
+    `;
+    const sheet = Utils.openSheet(fiche ? 'Modifier la fiche' : 'Nouvelle fiche instrumentiste', html);
+    sheet.querySelector('#if-save').addEventListener('click', () => {
+      const nom = sheet.querySelector('#if-nom').value.trim();
+      if (!nom) { Utils.toast('Le nom est requis'); return; }
+      Store.upsertInstrumentiste({
+        id: f.id, nom,
+        instrumentPrincipal: sheet.querySelector('#if-principal').value,
+        instrumentsSecondaires: Array.from(sheet.querySelectorAll('.if-secondaire-cb:checked')).map(cb=>cb.value),
+        niveauMusical: sheet.querySelector('#if-niveau').value,
+        dateEntree: sheet.querySelector('#if-date').value,
+        observations: sheet.querySelector('#if-obs').value,
+      });
+      Utils.closeSheet();
+      Utils.toast('Fiche enregistrée');
+      Router.render();
+    });
+    const delBtn = sheet.querySelector('#if-del');
+    if (delBtn) delBtn.addEventListener('click', () => {
+      Utils.confirmAction('Supprimer cette fiche instrumentiste ?', () => {
+        Store.deleteInstrumentiste(f.id);
+        Utils.closeSheet();
+        Utils.toast('Fiche supprimée');
+        Router.render();
+      });
+    });
+  },
+
+  renderRepetitionsInstrumentales(container, main) {
+    const reps = Store.getRepetitionsInstrumentales();
+    container.innerHTML = `
+      ${reps.length ? `<div class="list">${reps.map(r => `
+        <div class="list-row" data-id="${r.id}">
+          <div class="list-row__avatar">🗓️</div>
+          <div class="list-row__body">
+            <div class="list-row__title">${Utils.fmtDate(r.date)}</div>
+            <div class="list-row__subtitle">${Utils.escapeHtml(r.responsable||'—')} · ${(r.presents||[]).length} présent(s)</div>
+          </div>
+          <span class="list-row__chevron">›</span>
+        </div>
+      `).join('')}</div>` : `<div class="empty-state"><div class="empty-state__icon">🗓️</div><div class="empty-state__text">Aucune répétition instrumentale enregistrée</div></div>`}
+      <button class="btn primary block mt-16" id="btn-add-rep-instr">➕ Nouvelle répétition instrumentale</button>
+    `;
+    container.querySelector('#btn-add-rep-instr').addEventListener('click', () => this.openRepetitionInstrumentaleForm());
+    container.querySelectorAll('[data-id]').forEach(row => {
+      row.addEventListener('click', () => this.openRepetitionInstrumentaleForm(Store.getRepetitionsInstrumentales().find(r=>r.id===row.dataset.id)));
+    });
+  },
+
+  openRepetitionInstrumentaleForm(rep) {
+    const r = rep || { id: Utils.genId('repi'), date: Utils.todayISO(), responsable: '', presents: [], absents: [], retards: [], chantsTravailles: [], observationsTechniques: '', difficultes: '', notesTechniques: '', commentaires: '', axesAmelioration: '', ressourcesAudio: [] };
+    const fiches = Store.getInstrumentistes();
+    const statutFor = (nom) => r.presents.indexOf(nom)!==-1 ? 'Présent' : r.absents.indexOf(nom)!==-1 ? 'Absent' : r.retards.indexOf(nom)!==-1 ? 'Retard' : '';
+    const html = `
+      <div class="field"><label>Date</label><input type="date" id="ri-date" value="${r.date}"></div>
+      <div class="field"><label>Responsable</label><input type="text" id="ri-resp" value="${Utils.escapeHtml(r.responsable||'')}"></div>
+
+      <div class="section-title"><span class="ornament">✅</span> Présences</div>
+      <div class="card">
+        ${fiches.length ? fiches.map(f => `
+          <div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--line);">
+            <span style="font-weight:600;font-size:0.88rem;">${Utils.escapeHtml(f.nom)}</span>
+            <select class="ri-presence-select" data-nom="${Utils.escapeHtml(f.nom)}" style="width:auto;">
+              ${['', 'Présent', 'Absent', 'Retard'].map(opt => `<option value="${opt}" ${statutFor(f.nom)===opt?'selected':''}>${opt||'—'}</option>`).join('')}
+            </select>
+          </div>
+        `).join('') : '<div class="text-sm text-muted">Aucune fiche instrumentiste — ajoutez-en dans l\'onglet Fiches.</div>'}
+      </div>
+
+      <div class="field"><label>Chants travaillés (un par ligne)</label><textarea id="ri-chants" rows="3">${(r.chantsTravailles||[]).join('\n')}</textarea></div>
+      <div class="field"><label>Observations techniques</label><textarea id="ri-obs-tech" rows="2">${Utils.escapeHtml(r.observationsTechniques||'')}</textarea></div>
+      <div class="field"><label>Difficultés rencontrées</label><textarea id="ri-diff" rows="2">${Utils.escapeHtml(r.difficultes||'')}</textarea></div>
+
+      <div class="section-title"><span class="ornament">📝</span> Notes et appréciations</div>
+      <div class="field"><label>Notes techniques</label><textarea id="ri-notes-tech" rows="2">${Utils.escapeHtml(r.notesTechniques||'')}</textarea></div>
+      <div class="field"><label>Commentaires</label><textarea id="ri-comm" rows="2">${Utils.escapeHtml(r.commentaires||'')}</textarea></div>
+      <div class="field"><label>Axes d'amélioration</label><textarea id="ri-axes" rows="2">${Utils.escapeHtml(r.axesAmelioration||'')}</textarea></div>
+
+      <div class="section-title"><span class="ornament">🔗</span> Ressources audio</div>
+      <div class="field"><label>Liens (un par ligne — Google Drive, Dropbox, etc.)</label><textarea id="ri-audio" rows="2" placeholder="https://drive.google.com/...">${(r.ressourcesAudio||[]).map(a=>a.url).join('\n')}</textarea></div>
+
+      <div class="grid-2 mt-16">
+        ${rep ? '<button class="btn danger block" id="ri-del">🗑️ Supprimer</button>' : '<div></div>'}
+        <button class="btn primary block" id="ri-save">💾 Enregistrer</button>
+      </div>
+    `;
+    const sheet = Utils.openSheet(rep ? 'Modifier la répétition' : 'Nouvelle répétition instrumentale', html);
+    sheet.querySelector('#ri-save').addEventListener('click', () => {
+      const presents = [], absents = [], retards = [];
+      sheet.querySelectorAll('.ri-presence-select').forEach(sel => {
+        if (sel.value === 'Présent') presents.push(sel.dataset.nom);
+        else if (sel.value === 'Absent') absents.push(sel.dataset.nom);
+        else if (sel.value === 'Retard') retards.push(sel.dataset.nom);
+      });
+      const chants = sheet.querySelector('#ri-chants').value.split('\n').map(s=>s.trim()).filter(Boolean);
+      const audioUrls = sheet.querySelector('#ri-audio').value.split('\n').map(s=>s.trim()).filter(Boolean);
+      const data = {
+        date: sheet.querySelector('#ri-date').value,
+        responsable: sheet.querySelector('#ri-resp').value,
+        presents, absents, retards,
+        chantsTravailles: chants,
+        observationsTechniques: sheet.querySelector('#ri-obs-tech').value,
+        difficultes: sheet.querySelector('#ri-diff').value,
+        notesTechniques: sheet.querySelector('#ri-notes-tech').value,
+        commentaires: sheet.querySelector('#ri-comm').value,
+        axesAmelioration: sheet.querySelector('#ri-axes').value,
+        ressourcesAudio: audioUrls.map(url => ({ label: url, url })),
+      };
+      if (rep) {
+        Store.updateRepetitionInstrumentale(r.id, data);
+      } else {
+        Store.addRepetitionInstrumentale(Object.assign({ id: r.id }, data));
+      }
+      Utils.closeSheet();
+      Utils.toast('Répétition enregistrée');
+      Router.render();
+    });
+    const delBtn = sheet.querySelector('#ri-del');
+    if (delBtn) delBtn.addEventListener('click', () => {
+      Utils.confirmAction('Supprimer cette répétition instrumentale ?', () => {
+        Store.deleteRepetitionInstrumentale(r.id);
+        Utils.closeSheet();
+        Utils.toast('Répétition supprimée');
+        Router.render();
+      });
     });
   },
 
@@ -5958,7 +7283,16 @@ const DirectionModule = {
         </select>
       </div>
       <div id="chant-list"></div>
+      ${canManage ? '<button class="btn secondary block mt-16" id="exp-repertoire-excel">📤 Exporter le répertoire (Excel)</button>' : ''}
     `;
+
+    const expRepBtn = container.querySelector('#exp-repertoire-excel');
+    if (expRepBtn) {
+      expRepBtn.addEventListener('click', () => {
+        const rows = all.map(c => [c.titre||'', c.auteur||'', c.statut||'', c.niveauMaitrise||'', c.dateAjout||c.dateApprentissage||'']);
+        Utils.exportCSV('musique_repertoire', ['Titre','Auteur','Statut','Niveau de maîtrise','Date'], rows);
+      });
+    }
 
     if (!chants.length) {
       container.querySelector('#chant-list').innerHTML = `<div class="empty-state"><div class="empty-state__icon">🎵</div><div class="empty-state__text">Aucun chant trouvé</div></div>`;
@@ -6257,9 +7591,10 @@ const DirectionModule = {
       const test = Store.getTestIntegration(m.id);
       let result = '⏳ En observation';
       let pillClass = 'integrant';
-      if (test && test.moyenne) {
-        if (test.moyenne >= 10) { result = '✅ Admis'; pillClass = 'actif'; }
-        else { result = '❌ Refusé'; pillClass = 'suspendu'; }
+      if (test && test.decision) {
+        if (test.decision === 'Admis') { result = '✅ Admis'; pillClass = 'actif'; }
+        else if (test.decision === 'Admis sous réserve') { result = '⚠️ Admis sous réserve'; pillClass = 'derogation'; }
+        else { result = '❌ Non admis'; pillClass = 'suspendu'; }
       } else if (dis.total >= 2 && dis.txSamedi >= 0.7) {
         result = '✅ Éligible au test';
         pillClass = 'actif';
@@ -6301,6 +7636,19 @@ const DirectionModule = {
         <div class="font-display" id="test-avg" style="font-size:1.5rem;font-weight:700;color:var(--maroon);">0.0/20</div>
         <div class="text-sm mt-8" id="test-result">—</div>
       </div>
+      <div class="field">
+        <label>Observations du jury / Directeur de Chœur</label>
+        <textarea id="test-obs" rows="3">${Utils.escapeHtml(test.observations||'')}</textarea>
+      </div>
+      <div class="field">
+        <label>Décision finale</label>
+        <select id="test-decision">
+          <option value="">— À déterminer selon la moyenne —</option>
+          <option value="Admis" ${test.decision==='Admis'?'selected':''}>✅ Admis</option>
+          <option value="Admis sous réserve" ${test.decision==='Admis sous réserve'?'selected':''}>⚠️ Admis sous réserve</option>
+          <option value="Non admis" ${test.decision==='Non admis'?'selected':''}>❌ Non admis</option>
+        </select>
+      </div>
       <button class="btn primary block mt-16" id="save-test">💾 Enregistrer le test</button>
     `;
 
@@ -6313,10 +7661,12 @@ const DirectionModule = {
       const avg = sum / sliders.length;
       sheet.querySelector('#test-avg').textContent = avg.toFixed(2) + '/20';
       const resultEl = sheet.querySelector('#test-result');
-      if (avg >= 10) {
-        resultEl.innerHTML = '<span class="pill actif">✅ ADMIS (≥10/20)</span>';
+      if (avg >= 12) {
+        resultEl.innerHTML = '<span class="pill actif">✅ ADMIS (≥12/20)</span>';
+      } else if (avg >= 10) {
+        resultEl.innerHTML = '<span class="pill derogation">⚠️ ADMIS SOUS RÉSERVE (10-12/20)</span>';
       } else {
-        resultEl.innerHTML = '<span class="pill suspendu">❌ REFUSÉ (&lt;10/20)</span>';
+        resultEl.innerHTML = '<span class="pill suspendu">❌ NON ADMIS (&lt;10/20)</span>';
       }
     };
 
@@ -6333,15 +7683,21 @@ const DirectionModule = {
       sheet.querySelectorAll('[data-tcrit]').forEach(s => { notes[s.dataset.tcrit] = Number(s.value); });
       const vals = Object.values(notes);
       const moyenne = vals.reduce((a,b)=>a+b,0)/vals.length;
-      Store.setTestIntegration(membreId, { notes, moyenne, date: Utils.todayISO() });
+      const observations = sheet.querySelector('#test-obs').value;
+      let decision = sheet.querySelector('#test-decision').value;
+      if (!decision) decision = moyenne >= 12 ? 'Admis' : (moyenne >= 10 ? 'Admis sous réserve' : 'Non admis');
+      Store.setTestIntegration(membreId, { notes, moyenne, date: Utils.todayISO(), observations, decision });
 
-      if (moyenne >= 10) {
+      if (decision === 'Admis' || decision === 'Admis sous réserve') {
         Utils.closeSheet();
-        Utils.confirmAction(`${m.nom} est admis avec ${moyenne.toFixed(2)}/20. Le faire passer au statut <b>Choriste</b> ?`, () => {
+        Utils.confirmAction(`${m.nom} est ${decision.toLowerCase()} avec ${moyenne.toFixed(2)}/20. Le faire passer au statut <b>Choriste</b> ?`, () => {
           const newId = Store.nextMemberId('Choriste');
+          Store.migrateTestIntegration(membreId, newId);
+          Store.migrateCompteChoriste(membreId, newId);
           Store.deleteMembre(membreId);
           m.statut = 'Choriste';
           m.id = newId;
+          m.dateIntegration = Utils.todayISO(); // cotisations générées uniquement à partir de cette date
           Store.upsertMembre(m);
           Utils.toast(`${m.nom} est maintenant Choriste !`);
           Router.render();
@@ -7383,7 +8739,7 @@ const RapportsModule = {
     // R3 — Financier
     let totalDue=0, totalPaid=0, membresAJour=0, membresRetard=0;
     membres.forEach(m => {
-      const due = Store.getCotisationDue(m)*12;
+      const due = Store.getCotisationDueAnnuel(m, year);
       let paid = 0;
       for(let mo=1;mo<=12;mo++) paid += Store.getCotisation(m.id, `${year}-${String(mo).padStart(2,'0')}`);
       totalDue += due; totalPaid += paid;
@@ -7421,7 +8777,7 @@ const RapportsModule = {
       const dis = Store.getDisciplineStats(m.id);
       const test = Store.getTestIntegration(m.id);
       if (test && test.moyenne!=null) {
-        if (test.moyenne>=10) admis++; else refuses++;
+        if (test.decision === 'Non admis') refuses++; else admis++;
       } else if (dis.total>=2 && dis.txSamedi>=0.7) eligibles++;
     });
 
@@ -7820,7 +9176,153 @@ const ClassementsModule = {
   },
 };
 
-// ===== MODULE: PARAMETRES =====
+// ===== MODULE: ARCHIVES DES ANCIENS CHORISTES =====
+// ════════════════════════════════════════════════════════════════
+// ARCHIVES — Mémoire des membres ayant quitté la chorale (Admin uniquement)
+// ════════════════════════════════════════════════════════════════
+
+const ArchivesModule = {
+  tab: 'liste', // liste | stats
+
+  MOTIFS_DEPART: ["Fin d'études", 'Affectation professionnelle', 'Mutation', 'Raisons familiales', 'Démission', 'Autre'],
+
+  render(main) {
+    if (!Permissions.isAdmin()) {
+      main.innerHTML = `<div class="alert-banner danger"><div class="alert-banner__icon">🔒</div><div>Ce module est réservé à l'Administrateur.</div></div>`;
+      return;
+    }
+    const tabs = [
+      { key: 'liste', label: '🗃️ Archives' },
+      { key: 'stats', label: '📊 Statistiques' },
+    ];
+    main.innerHTML = `
+      <div class="tabbar">${tabs.map(t=>`<button class="tab-btn ${this.tab===t.key?'active':''}" data-tab="${t.key}">${t.label}</button>`).join('')}</div>
+      <div id="arch-content"></div>
+    `;
+    main.querySelectorAll('[data-tab]').forEach(btn => {
+      btn.addEventListener('click', () => { this.tab = btn.dataset.tab; this.render(main); });
+    });
+    const content = main.querySelector('#arch-content');
+    if (this.tab === 'stats') this.renderStats(content);
+    else this.renderListe(content, main);
+  },
+
+  renderListe(container, main) {
+    const archives = Store.getArchives();
+    container.innerHTML = `
+      <button class="btn secondary block" id="btn-archiver-membre">➕ Archiver un membre actif</button>
+      ${archives.length ? `<div class="list mt-16">${archives.map(a => `
+        <div class="list-row" data-id="${a.id}">
+          <div class="list-row__avatar">${Utils.initials(a.nom)}</div>
+          <div class="list-row__body">
+            <div class="list-row__title">${Utils.escapeHtml(a.nom)} ${a.prenom?Utils.escapeHtml(a.prenom):''}</div>
+            <div class="list-row__subtitle">${a.voix||'—'} · Départ : ${Utils.fmtDate(a.dateDepart)} · ${a.motifDepart}</div>
+          </div>
+          <span class="list-row__chevron">›</span>
+        </div>
+      `).join('')}</div>` : `<div class="empty-state mt-16"><div class="empty-state__icon">🗃️</div><div class="empty-state__text">Aucun ancien choriste archivé</div></div>`}
+    `;
+    container.querySelector('#btn-archiver-membre').addEventListener('click', () => this.openArchiverForm());
+    container.querySelectorAll('[data-id]').forEach(row => {
+      row.addEventListener('click', () => this.openArchiveDetail(row.dataset.id));
+    });
+  },
+
+  openArchiverForm() {
+    const actifs = Store.data.membres.slice().sort((a,b)=>a.nom.localeCompare(b.nom));
+    if (!actifs.length) { Utils.toast('Aucun membre actif à archiver'); return; }
+    const html = `
+      <div class="alert-banner warn"><div class="alert-banner__icon">⚠️</div><div>Le membre sera retiré des listes actives (membres, cotisations, présences) et basculé dans les archives. Cette action n'efface aucune donnée historique (sanctions, paiements...).</div></div>
+      <div class="field"><label>Membre à archiver</label>
+        <select id="ar-membre">${actifs.map(m=>`<option value="${m.id}">${Utils.escapeHtml(m.nom)} (${m.statut})</option>`).join('')}</select>
+      </div>
+      <div class="field"><label>Date de départ</label><input type="date" id="ar-date" value="${Utils.todayISO()}"></div>
+      <div class="field"><label>Motif du départ</label>
+        <select id="ar-motif">${this.MOTIFS_DEPART.map(m=>`<option value="${m}">${m}</option>`).join('')}</select>
+      </div>
+      <button class="btn danger block" id="ar-save">🗃️ Archiver ce membre</button>
+    `;
+    const sheet = Utils.openSheet('Archiver un membre', html);
+    sheet.querySelector('#ar-save').addEventListener('click', () => {
+      const membreId = sheet.querySelector('#ar-membre').value;
+      Utils.confirmAction('Confirmer l\'archivage de ce membre ? Il disparaîtra des listes actives.', () => {
+        Store.archiverMembre(membreId, {
+          dateDepart: sheet.querySelector('#ar-date').value,
+          motifDepart: sheet.querySelector('#ar-motif').value,
+        });
+        Utils.closeSheet();
+        Utils.toast('Membre archivé');
+        Router.render();
+      });
+    });
+  },
+
+  openArchiveDetail(id) {
+    const a = Store.getArchive(id);
+    if (!a) return;
+    const html = `
+      <div class="card">
+        ${MembresModule.infoRow('Sexe', a.sexe==='M'?'Masculin':'Féminin')}
+        ${MembresModule.infoRow('Voix / Pupitre', a.voix||'—')}
+        ${MembresModule.infoRow("Date d'entrée", Utils.fmtDate(a.dateEntree))}
+        ${MembresModule.infoRow('Date de départ', Utils.fmtDate(a.dateDepart))}
+        ${MembresModule.infoRow('Motif du départ', a.motifDepart)}
+        ${MembresModule.infoRow('Années de service', (a.anneesService!=null?a.anneesService:'—') + ' an(s)')}
+        ${MembresModule.infoRow('Services occupés', (a.services||[]).join(', ')||'—')}
+        ${MembresModule.infoRow('Fonctions exercées', (a.fonctions||[]).join(', ')||'—')}
+      </div>
+
+      <div class="section-title"><span class="ornament">💌</span> Témoignage d'affection</div>
+      <div class="field"><textarea id="ad-temoignage" rows="4" placeholder="Message de reconnaissance, souvenir, hommage...">${Utils.escapeHtml(a.temoignage||'')}</textarea></div>
+
+      <div class="section-title"><span class="ornament">🖼️</span> Galerie souvenir (photos, documents, liens)</div>
+      <div class="field"><textarea id="ad-galerie" rows="3" placeholder="Un lien par ligne (photo, document, ou autre)">${(a.galerie||[]).map(g=>g.url).join('\n')}</textarea></div>
+
+      <div class="grid-2 mt-16">
+        <button class="btn danger block" id="ad-del">🗑️ Supprimer l'archive</button>
+        <button class="btn primary block" id="ad-save">💾 Enregistrer</button>
+      </div>
+    `;
+    const sheet = Utils.openSheet(`${a.nom} — Archive`, html);
+    sheet.querySelector('#ad-save').addEventListener('click', () => {
+      const liens = sheet.querySelector('#ad-galerie').value.split('\n').map(s=>s.trim()).filter(Boolean);
+      Store.updateArchive(id, {
+        temoignage: sheet.querySelector('#ad-temoignage').value,
+        galerie: liens.map(url => ({ type: 'lien', label: url, url })),
+      });
+      Utils.closeSheet();
+      Utils.toast('Archive mise à jour');
+      Router.render();
+    });
+    sheet.querySelector('#ad-del').addEventListener('click', () => {
+      Utils.confirmAction('Supprimer définitivement cette archive ?', () => {
+        Store.deleteArchive(id);
+        Utils.closeSheet();
+        Utils.toast('Archive supprimée');
+        Router.render();
+      });
+    });
+  },
+
+  renderStats(container) {
+    const stats = Store.getArchivesStats();
+    container.innerHTML = `
+      <div class="card center"><div class="text-sm text-muted">Total anciens choristes</div><div class="font-display" style="font-size:1.6rem;font-weight:700;color:var(--maroon);">${stats.total}</div></div>
+
+      <div class="section-title"><span class="ornament">🎓</span> Répartition par promotion (année d'entrée)</div>
+      <div class="card">${Object.keys(stats.parPromotion).sort().length ? Object.keys(stats.parPromotion).sort().map(p => `
+        <div class="flex-between" style="padding:5px 0;border-bottom:1px solid var(--line);"><span class="text-sm text-muted">${p}</span><span style="font-weight:700;">${stats.parPromotion[p]}</span></div>
+      `).join('') : '<div class="text-sm text-muted">Aucune donnée</div>'}</div>
+
+      <div class="section-title"><span class="ornament">📋</span> Répartition par motif de départ</div>
+      <div class="card">${Object.keys(stats.parMotif).length ? Object.keys(stats.parMotif).map(m => `
+        <div class="flex-between" style="padding:5px 0;border-bottom:1px solid var(--line);"><span class="text-sm text-muted">${m}</span><span style="font-weight:700;">${stats.parMotif[m]}</span></div>
+      `).join('') : '<div class="text-sm text-muted">Aucune donnée</div>'}</div>
+    `;
+  },
+};
+
+
 // ════════════════════════════════════════════════════════════════
 // PARAMÈTRES — Règles, tarifs, infos système
 // ════════════════════════════════════════════════════════════════
@@ -7831,7 +9333,8 @@ const ParametresModule = {
     const storageSize = JSON.stringify(d).length;
     const storageKB = (storageSize/1024).toFixed(1);
     const isAdmin = Permissions.isAdmin();
-    const extraDeptsList = Permissions.role === 'bureau'
+    const isBureau = Permissions.role === 'bureau';
+    const extraDeptsList = isBureau
       ? DEPARTEMENTS.filter(d => d.key !== Permissions.departement && Permissions._hasExtendedDeptAccess(d.key)).map(d => d.label)
       : [];
 
@@ -7847,15 +9350,15 @@ const ParametresModule = {
             <div class="alert-banner__icon">ℹ️</div>
             <div>En tant que <b>choriste</b>, vous avez un accès en <b>lecture</b> sur la plupart des modules et pouvez envoyer des <b>suggestions</b>. Pour toute question sur vos cotisations, adressez-vous au trésorier.</div>
           </div>
-        ` : Permissions.role === 'bureau' ? `
+        ` : isBureau ? `
           <div class="alert-banner success mt-16">
             <div class="alert-banner__icon">✅</div>
-            <div>Votre profil vous donne la <b>gestion complète</b> (consultation et modification) du département <b>${DEPARTEMENTS.find(d=>d.key===Permissions.departement)?.label || Permissions.departement}</b>${extraDeptsList.length ? `, ainsi que <b>${extraDeptsList.join(' et ')}</b>` : ''}. Les autres départements restent en lecture seule.</div>
+            <div>Votre profil vous donne la <b>gestion complète</b> du département <b>${DEPARTEMENTS.find(d=>d.key===Permissions.departement)?.label || Permissions.departement}</b>${Permissions.departement === 'direction' ? ' <em style="font-size:0.8em;">(Répertoire, Prestations, Répétitions)</em>' : ''}${extraDeptsList.length ? `, ainsi que l'accès à <b>${extraDeptsList.join(' et ')}</b>` : ''}. Vous gérez également les <b>Membres</b> (accès partagé bureau). Les autres départements restent en lecture seule.</div>
           </div>
         ` : `
           <div class="alert-banner success mt-16">
             <div class="alert-banner__icon">✅</div>
-            <div>Votre rôle vous donne accès à la <b>gestion complète</b> de tous les départements (membres, discipline, finance, secrétariat, direction technique, prestations, répétitions).</div>
+            <div>Votre rôle vous donne accès à la <b>gestion complète</b> de tous les modules : <b>Secrétariat, Discipline, Trésorerie, Direction Technique</b> (Répertoire, Prestations, Répétitions) et Membres.</div>
           </div>
         `}
         ${isAdmin ? `
@@ -7867,6 +9370,37 @@ const ParametresModule = {
         ${!Permissions.isChoriste() ? `<button class="btn secondary block mt-16" id="change-pass-btn">🔑 Modifier mon mot de passe</button>` : ''}
         <button class="btn danger block mt-16" id="logout-btn">🚪 Se déconnecter</button>
       </div>
+
+      ${(isAdmin || isBureau) ? `
+      <div class="section-title"><span class="ornament">🔑</span> Mots de passe des départements</div>
+      <div class="card">
+        <div class="alert-banner info" style="margin-bottom:12px;">
+          <div class="alert-banner__icon">ℹ️</div>
+          <div>
+            ${isAdmin
+              ? `En tant qu'<b>administrateur</b>, vous pouvez modifier le mot de passe de <b>tous les départements</b>. Vous pouvez également <b>réinitialiser</b> un mot de passe oublié (retour au mot de passe par défaut sur cet appareil).`
+              : `En tant que responsable du département <b>${DEPARTEMENTS.find(d=>d.key===Permissions.departement)?.label || Permissions.departement}</b>, vous pouvez modifier le mot de passe de votre département.`
+            }
+          </div>
+        </div>
+        <div id="dept-pwd-list">
+          ${DEPARTEMENTS.filter(dept =>
+            isAdmin || dept.key === Permissions.departement
+          ).map(dept => `
+            <div class="flex-between" style="padding:10px 0;border-bottom:1px solid var(--line);align-items:center;">
+              <div>
+                <span style="font-size:1.1rem;">${dept.icon}</span>
+                <span style="font-weight:600;margin-left:6px;">${dept.label}</span>
+              </div>
+              <div style="display:flex;gap:6px;">
+                <button class="btn secondary sm" data-change-dept="${dept.key}">✏️ Modifier</button>
+                ${isAdmin ? `<button class="btn danger sm" data-reset-dept="${dept.key}">↩️ Réinit.</button>` : ''}
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+      ` : ''}
 
       <div class="section-title"><span class="ornament">⚙️</span> Configuration</div>
       <div class="card">
@@ -7973,7 +9507,7 @@ const ParametresModule = {
 
       <div class="section-title"><span class="ornament">ℹ️</span> À propos</div>
       <div class="card center">
-        <div class="font-display" style="font-size:1.1rem;font-weight:700;color:var(--maroon);">🎵 Carnet de Chorale</div>
+        <div class="font-display" style="font-size:1.1rem;font-weight:700;color:var(--maroon);">🎵 SVS-EEI</div>
         <div class="text-sm text-muted mt-8">Version 3.0 — ERP de gestion de chorale (PWA)</div>
         <div class="text-sm text-muted mt-8">⚠️ Les données sont enregistrées localement sur cet appareil/navigateur uniquement — il n'y a pas de synchronisation entre plusieurs appareils. Pensez à utiliser régulièrement l'export JSON (module Rapports) pour garder une sauvegarde.</div>
       </div>
@@ -8002,6 +9536,18 @@ const ParametresModule = {
       changePassBtn.addEventListener('click', () => this.openChangePasswordSheet());
     }
 
+    // ── Boutons modification/réinitialisation des mots de passe de département ──
+    main.querySelectorAll('[data-change-dept]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        this.openChangeDeptPasswordSheet(btn.dataset.changeDept);
+      });
+    });
+    main.querySelectorAll('[data-reset-dept]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        this.openResetDeptPasswordSheet(btn.dataset.resetDept);
+      });
+    });
+
     const installBtn = main.querySelector('#install-app-btn');
     if (installBtn) {
       installBtn.addEventListener('click', async () => {
@@ -8016,11 +9562,10 @@ const ParametresModule = {
     }
   },
 
-  // ── Changement de mot de passe (Administrateur et Bureau uniquement) ──
-  // Nouvelle fonctionnalité additive : ne touche à aucun mot de passe
-  // tant que l'utilisateur ne confirme pas son mot de passe ACTUEL.
+  // ── Changement du mot de passe personnel (Administrateur uniquement via ce formulaire) ──
   openChangePasswordSheet() {
     const isAdmin = Permissions.isAdmin();
+    const isBureau = Permissions.role === 'bureau';
     const html = `
       <div class="field">
         <label>Mot de passe actuel</label>
@@ -8036,7 +9581,7 @@ const ParametresModule = {
       </div>
       <div id="cp-error" class="auth-error" style="display:none;"></div>
       <button class="btn primary block mt-8" id="cp-save">💾 Enregistrer le nouveau mot de passe</button>
-      <div class="text-sm text-muted mt-8">⚠️ Ce changement n'est appliqué que sur cet appareil/navigateur (il n'y a pas de serveur central pour le synchroniser ailleurs).</div>
+      <div class="text-sm text-muted mt-8">⚠️ Ce changement n'est appliqué que sur cet appareil/navigateur.</div>
     `;
     const sheet = Utils.openSheet('🔑 Modifier mon mot de passe', html);
     const errorEl = sheet.querySelector('#cp-error');
@@ -8044,14 +9589,72 @@ const ParametresModule = {
     sheet.querySelector('#cp-save').addEventListener('click', () => {
       errorEl.style.display = 'none';
       const current = sheet.querySelector('#cp-current').value;
-      const next = sheet.querySelector('#cp-new').value;
+      const next    = sheet.querySelector('#cp-new').value;
       const confirm = sheet.querySelector('#cp-confirm').value;
 
-      const currentOk = isAdmin
-        ? current === CredentialsStore.getAdminPassword()
-        : current === CredentialsStore.getBureauPassword(Permissions.bureauId);
+      let currentOk = false;
+      if (isAdmin) {
+        currentOk = current === CredentialsStore.getAdminPassword();
+      } else if (isBureau) {
+        currentOk = current === CredentialsStore.getDeptPassword(Permissions.departement);
+      }
 
-      if (!currentOk) {
+      if (!currentOk) { errorEl.textContent = 'Mot de passe actuel incorrect.'; errorEl.style.display = ''; return; }
+      if (!next || next.length < 6) { errorEl.textContent = 'Le nouveau mot de passe doit contenir au moins 6 caractères.'; errorEl.style.display = ''; return; }
+      if (next !== confirm) { errorEl.textContent = 'Les deux mots de passe ne correspondent pas.'; errorEl.style.display = ''; return; }
+
+      if (isAdmin) {
+        CredentialsStore.setAdminPassword(next);
+        Store.logAction('Modification mot de passe', 'Paramètres', 'Mot de passe Administrateur modifié');
+      } else {
+        const dept = DEPARTEMENTS.find(d => d.key === Permissions.departement);
+        CredentialsStore.setDeptPassword(Permissions.departement, next);
+        Store.logAction('Modification mot de passe', 'Paramètres', `Mot de passe département ${dept ? dept.label : Permissions.departement} modifié`);
+      }
+      Utils.closeSheet();
+      Utils.toast('🔑 Mot de passe mis à jour');
+    });
+  },
+
+  // ── Modification du mot de passe d'un département (Admin ou responsable du dept) ──
+  openChangeDeptPasswordSheet(deptKey) {
+    const isAdmin = Permissions.isAdmin();
+    const dept = DEPARTEMENTS.find(d => d.key === deptKey);
+    const deptLabel = dept ? dept.label : deptKey;
+
+    const html = `
+      <div class="alert-banner info" style="margin-bottom:12px;">
+        <div class="alert-banner__icon">${dept ? dept.icon : '🗂️'}</div>
+        <div>Modification du mot de passe du département <b>${Utils.escapeHtml(deptLabel)}</b>.</div>
+      </div>
+      <div class="field">
+        <label>Mot de passe actuel du département</label>
+        <input type="password" id="dp-current" autocomplete="current-password">
+      </div>
+      <div class="field">
+        <label>Nouveau mot de passe</label>
+        <input type="password" id="dp-new" autocomplete="new-password" placeholder="6 caractères minimum">
+      </div>
+      <div class="field">
+        <label>Confirmer le nouveau mot de passe</label>
+        <input type="password" id="dp-confirm" autocomplete="new-password">
+      </div>
+      <div id="dp-error" class="auth-error" style="display:none;"></div>
+      <button class="btn primary block mt-8" id="dp-save">💾 Enregistrer</button>
+      <div class="text-sm text-muted mt-8">⚠️ Ce changement n'est appliqué que sur cet appareil/navigateur.</div>
+    `;
+    const sheet = Utils.openSheet(`🔑 Mot de passe — ${deptLabel}`, html);
+    const errorEl = sheet.querySelector('#dp-error');
+
+    sheet.querySelector('#dp-save').addEventListener('click', () => {
+      errorEl.style.display = 'none';
+      const current = sheet.querySelector('#dp-current').value;
+      const next    = sheet.querySelector('#dp-new').value;
+      const confirm = sheet.querySelector('#dp-confirm').value;
+
+      // Vérification du mot de passe actuel
+      const expected = CredentialsStore.getDeptPassword(deptKey);
+      if (!expected || current !== expected) {
         errorEl.textContent = 'Mot de passe actuel incorrect.';
         errorEl.style.display = '';
         return;
@@ -8067,16 +9670,36 @@ const ParametresModule = {
         return;
       }
 
-      if (isAdmin) {
-        CredentialsStore.setAdminPassword(next);
-      } else {
-        CredentialsStore.setBureauPassword(Permissions.bureauId, next);
-      }
+      CredentialsStore.setDeptPassword(deptKey, next);
+      Store.logAction('Modification mot de passe', 'Paramètres',
+        `Mot de passe département ${deptLabel} modifié par ${Permissions.label()}`);
       Utils.closeSheet();
-      Utils.toast('🔑 Mot de passe mis à jour');
+      Utils.toast(`🔑 Mot de passe du département ${deptLabel} mis à jour`);
     });
   },
+
+  // ── Réinitialisation d'un mot de passe de département (Admin uniquement) ──
+  // Remet le mot de passe par défaut (défini dans BUREAU_DEPT_PASSWORDS)
+  openResetDeptPasswordSheet(deptKey) {
+    if (!Permissions.isAdmin()) { Permissions.denyToast(); return; }
+    const dept = DEPARTEMENTS.find(d => d.key === deptKey);
+    const deptLabel = dept ? dept.label : deptKey;
+    const defaultPwd = BUREAU_DEPT_PASSWORDS[deptKey] || '(aucun)';
+
+    Utils.confirmAction(
+      `Réinitialiser le mot de passe du département <b>${Utils.escapeHtml(deptLabel)}</b> ?<br><br>` +
+      `Le mot de passe sera remis à la valeur par défaut (définie dans le code source de l'application). ` +
+      `Cette action ne peut pas être annulée.`,
+      () => {
+        CredentialsStore.resetDeptPassword(deptKey);
+        Store.logAction('Réinitialisation mot de passe', 'Paramètres',
+          `Mot de passe département ${deptLabel} réinitialisé par l'Administrateur`);
+        Utils.toast(`↩️ Mot de passe du département ${deptLabel} réinitialisé`);
+      }
+    );
+  },
 };
+
 
 // ===== APP =====
 // ════════════════════════════════════════════════════════════════
@@ -8098,6 +9721,7 @@ const NAV_ITEMS = [
   { key: 'suggestions',   icon: '💡', label: 'Idées',     title: 'Suggestions',          subtitle: 'Boîte à idées & remarques' },
   { key: 'rapports',      icon: '📈', label: 'Rapports',  title: 'Rapports',             subtitle: 'Synthèse automatique' },
   { key: 'classements',   icon: '🏆', label: 'Classmt.',  title: 'Classements',          subtitle: 'Musical · Discipline · Trésorerie · Global' },
+  { key: 'archives',      icon: '🗃️', label: 'Archives',  title: 'Archives des Anciens', subtitle: 'Mémoire des membres ayant quitté la chorale' },
   { key: 'parametres',    icon: '⚙️', label: 'Réglages',  title: 'Paramètres',           subtitle: 'Configuration du système' },
 ];
 
@@ -8108,8 +9732,10 @@ const NAV_ITEMS = [
 // paramètres). L'admin et les choristes voient tout (lecture seule pour
 // les choristes, contrôle total pour l'admin).
 function getVisibleNavItems() {
-  if (Permissions.isAdmin() || Permissions.isChoriste()) return NAV_ITEMS;
-  return NAV_ITEMS.filter(item => {
+  // 5 — Archives des Anciens Choristes : réservé à l'Administrateur.
+  const items = NAV_ITEMS.filter(item => item.key !== 'archives' || Permissions.isAdmin());
+  if (Permissions.isAdmin() || Permissions.isChoriste()) return items;
+  return items.filter(item => {
     const dept = DEPT_FOR_ROUTE[item.key];
     return !dept || Permissions._hasExtendedDeptAccess(dept);
   });
@@ -8126,7 +9752,7 @@ function buildApp() {
   header.className = 'app-header';
   header.innerHTML = `
     <div class="app-header__top">
-      <div class="app-header__title"><span class="ornament">🎵</span> <span id="header-title">Chorale</span></div>
+      <div class="app-header__title"><span class="ornament">🎵</span> <span id="header-title">SVS-EEI</span></div>
       <div class="header-actions">
         <div class="app-header__year">${Store.data.meta.annee}</div>
         <button class="user-btn" id="user-menu-btn" title="${Utils.escapeHtml(Permissions.displayName())}">${roleIcon}</button>
@@ -8177,6 +9803,7 @@ function buildApp() {
   Router.register('suggestions', (m) => SuggestionsModule.render(m));
   Router.register('rapports', (m) => RapportsModule.render(m));
   Router.register('classements', (m) => ClassementsModule.render(m));
+  Router.register('archives', (m) => ArchivesModule.render(m));
   Router.register('parametres', (m) => ParametresModule.render(m));
 
   // Si la route mémorisée dans le hash n'est pas visible pour ce profil,
@@ -8236,7 +9863,7 @@ function showUserMenu() {
       <div class="list-row__avatar" style="width:54px;height:54px;font-size:1.3rem;margin:0 auto 8px;">${Permissions.isAdmin() ? '👑' : Permissions.isBureau() ? '🗂️' : '🎵'}</div>
       <div style="font-weight:700;">${Utils.escapeHtml(Permissions.displayName())}</div>
       <div class="mt-8"><span class="pill bureau">${Permissions.label()}</span></div>
-      <div class="text-sm text-muted mt-8">💾 Données synchronisées avec repli local</div>
+      <div class="text-sm text-muted mt-8">💾 Données enregistrées sur cet appareil</div>
     </div>
     <button class="btn danger block mt-16" id="logout-menu-btn">🚪 Se déconnecter</button>
   `;
@@ -8282,16 +9909,13 @@ function updateNotificationsBadge() {
   }
 }
 
+// Stockage 100% local : il n'y a plus de "synchronisation" à proprement
+// parler. Cette fonction est conservée (appelée par Store.save()) mais ne
+// fait qu'afficher une confirmation visuelle discrète de l'enregistrement.
 function setSyncStatus(status) {
   const label = document.getElementById('sync-label');
   if (!label) return;
-  const labels = {
-    local: 'Local',
-    syncing: 'Synchronisation...',
-    synced: FirebaseBridge.enabled ? 'En ligne' : 'Local',
-    error: 'Erreur sync - local conserve',
-  };
-  label.textContent = labels[status] || labels.local;
+  label.textContent = status === 'error' ? '⚠️ Erreur d\'enregistrement' : '💾 Local';
 }
 
 // ── PWA : invite d'installation (câblage de la bannière .install-banner) ──
@@ -8416,6 +10040,15 @@ document.addEventListener('DOMContentLoaded', () => {
   // l'app. Sinon (pas de profil, ou plus de 15 min d'inactivité depuis la
   // dernière utilisation), on revient à l'écran de connexion.
   const savedProfile = LocalProfile.load();
+
+  // Rétrocompatibilité : ancien profil Bureau avec bureauId individuel
+  // → on déduit le département depuis BUREAU_ACCOUNTS si le département
+  //   n'est pas encore stocké directement.
+  if (savedProfile && savedProfile.role === 'bureau' && savedProfile.bureauId && !savedProfile.departement) {
+    const acc = BUREAU_ACCOUNTS[savedProfile.bureauId];
+    if (acc) savedProfile.departement = acc.departement;
+  }
+
   if (savedProfile && savedProfile.role && !SessionGuard.isExpired() && (savedProfile.role !== 'choriste' || savedProfile.choristeMembreId)) {
     Permissions.setProfile(savedProfile);
     startApp();
