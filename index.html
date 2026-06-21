@@ -392,6 +392,19 @@ body {
 .mt-8 { margin-top: 8px; }
 .mt-16 { margin-top: 16px; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+/* ── Champ mot de passe avec icône Afficher/Masquer ── */
+.pwd-field { position:relative; }
+.pwd-field input[type="password"],
+.pwd-field input[type="text"] { padding-right: 44px !important; }
+.pwd-toggle { position:absolute; right:10px; top:50%; transform:translateY(-50%); background:none; border:none; cursor:pointer; font-size:1.1rem; color:var(--ink-soft); padding:4px; line-height:1; }
+.pwd-toggle:hover { color:var(--maroon); }
+.toggle-switch { position:relative; display:inline-block; width:48px; height:26px; flex-shrink:0; cursor:pointer; }
+.toggle-switch input { opacity:0; width:0; height:0; position:absolute; }
+.toggle-switch__slider { position:absolute; inset:0; background:var(--cream-deep); border-radius:26px; transition:.25s; border:1px solid var(--line); }
+.toggle-switch__slider::before { content:''; position:absolute; height:20px; width:20px; left:2px; bottom:2px; background:#fff; border-radius:50%; transition:.25s; box-shadow:0 1px 3px rgba(0,0,0,.25); }
+.toggle-switch input:checked + .toggle-switch__slider { background:var(--green); border-color:var(--green); }
+.toggle-switch input:checked + .toggle-switch__slider::before { transform:translateX(22px); }
 .divider { height: 1px; background: var(--line); margin: 14px 0; }
 .font-display { font-family: var(--font-display); }
 .center { text-align: center; }
@@ -660,6 +673,7 @@ const SEED_DATA = {
     choraleAnneeCreation: '',
     choraleParoisse:  '',
     soldeReporte: 0,   // Solde reporté de l'exercice précédent (éditable en Paramètres)
+    classementVisible: false, // Publication des classements (contrôlée par l'Admin)
   },
 
   // ── BUREAU ──
@@ -958,6 +972,34 @@ const Utils = {
     }[c]));
   },
 
+  // ── Wrapper HTML pour un champ mot de passe avec bouton Afficher/Masquer ──
+  // Usage : dans une template string, remplacer <input type="password" id="X">
+  // par Utils.pwdInput('X', 'placeholder', 'autocomplete-value')
+  pwdInput(id, placeholder = '••••••••', autocomplete = 'current-password') {
+    return `
+      <div class="pwd-field">
+        <input type="password" id="${id}" autocomplete="${autocomplete}" placeholder="${placeholder}">
+        <button type="button" class="pwd-toggle" data-pwd-for="${id}" aria-label="Afficher / Masquer le mot de passe" title="Afficher / Masquer">👁️</button>
+      </div>`;
+  },
+
+  // Attache les événements de toggle sur les boutons .pwd-toggle
+  // Appelé automatiquement par openSheet() et dans les rendus inline.
+  initPwdToggles(root) {
+    (root || document).querySelectorAll('.pwd-toggle').forEach(btn => {
+      if (btn._pwdBound) return;
+      btn._pwdBound = true;
+      btn.addEventListener('click', () => {
+        const input = (root || document).querySelector('#' + btn.dataset.pwdFor);
+        if (!input) return;
+        const show = input.type === 'password';
+        input.type = show ? 'text' : 'password';
+        btn.textContent = show ? '🙈' : '👁️';
+        btn.title = show ? 'Masquer le mot de passe' : 'Afficher le mot de passe';
+      });
+    });
+  },
+
   toast(msg) {
     const existing = document.querySelector('.toast');
     if (existing) existing.remove();
@@ -990,6 +1032,9 @@ const Utils = {
       }
     });
     document.body.appendChild(overlay);
+    const body = overlay.querySelector('.sheet__body');
+    // Init password-toggle buttons injected via Utils.pwdInput()
+    Utils.initPwdToggles(body);
     return overlay;
   },
 
@@ -1863,6 +1908,16 @@ const Store = {
   },
 
   deleteSanction(id) { this.data.sanctions = this.data.sanctions.filter(s=>s.id!==id); this.save(); },
+
+  // ── VISIBILITÉ DES CLASSEMENTS (contrôlée par l'Admin) ──────────
+  isClassementVisible() { return !!this.data.meta.classementVisible; },
+  setClassementVisible(bool) {
+    this.data.meta.classementVisible = !!bool;
+    this.save();
+    this.logAction(bool ? 'Publication classements' : 'Masquage classements', 'Classements',
+      bool ? 'Classements publiés et visibles pour tous les utilisateurs autorisés'
+           : 'Classements masqués aux utilisateurs');
+  },
 
   // ── ACTIVITÉS ──
   getActivites() { return this.data.activites.slice().sort((a,b)=>b.date.localeCompare(a.date)); },
@@ -2967,7 +3022,7 @@ const ProfileSelectorUI = {
         <form id="ps-login-form">
           <div class="field" style="text-align:left;">
             <label>Mot de passe</label>
-            <input type="password" id="ps-login-pass" autocomplete="current-password" placeholder="••••••••">
+            ${Utils.pwdInput('ps-login-pass', '••••••••', 'current-password')}
           </div>
           <button type="submit" class="btn primary block mt-8">Se connecter</button>
         </form>
@@ -2979,6 +3034,8 @@ const ProfileSelectorUI = {
       e.preventDefault();
       this._submitLogin(c);
     });
+
+    Utils.initPwdToggles(c);
 
     c.querySelector('#ps-back').addEventListener('click', (e) => {
       e.preventDefault();
@@ -3039,7 +3096,7 @@ const ProfileSelectorUI = {
         <form id="ps-dept-pwd-form">
           <div class="field" style="text-align:left;">
             <label>Mot de passe du département</label>
-            <input type="password" id="ps-dept-pass" autocomplete="current-password" placeholder="••••••••" autofocus>
+            ${Utils.pwdInput('ps-dept-pass', '••••••••', 'current-password')}
           </div>
           <button type="submit" class="btn primary block mt-8">Accéder</button>
         </form>
@@ -3054,6 +3111,8 @@ const ProfileSelectorUI = {
       e.preventDefault();
       this._submitBureauDeptLogin(c);
     });
+
+    Utils.initPwdToggles(c);
 
     c.querySelector('#ps-back-dept').addEventListener('click', (e) => {
       e.preventDefault();
@@ -3157,7 +3216,7 @@ const ProfileSelectorUI = {
           </div>
           <div class="field" style="text-align:left;">
             <label>Mot de passe</label>
-            <input type="password" id="ps-cl-pass" autocomplete="current-password" placeholder="••••••••">
+            ${Utils.pwdInput('ps-cl-pass', '••••••••', 'current-password')}
           </div>
           <button type="submit" class="btn primary block mt-8">Se connecter</button>
         </form>
@@ -3170,6 +3229,7 @@ const ProfileSelectorUI = {
       e.preventDefault();
       this._submitChoristeLogin(c);
     });
+    Utils.initPwdToggles(c);
     c.querySelector('#ps-back').addEventListener('click', (e) => {
       e.preventDefault();
       this.step = 'role';
@@ -3241,11 +3301,11 @@ const ProfileSelectorUI = {
         <form id="ps-create-form">
           <div class="field" style="text-align:left;">
             <label>Nouveau mot de passe</label>
-            <input type="password" id="ps-cc-pass1" autocomplete="new-password" placeholder="Au moins 4 caractères">
+            ${Utils.pwdInput('ps-cc-pass1', 'Au moins 4 caractères', 'new-password')}
           </div>
           <div class="field" style="text-align:left;">
             <label>Confirmez le mot de passe</label>
-            <input type="password" id="ps-cc-pass2" autocomplete="new-password" placeholder="••••••••">
+            ${Utils.pwdInput('ps-cc-pass2', '••••••••', 'new-password')}
           </div>
           <button type="submit" class="btn primary block mt-8">Créer mon mot de passe</button>
         </form>
@@ -3293,117 +3353,275 @@ const DashboardModule = {
     this.renderBureau(main);
   },
 
-  // ── TABLEAU DE BORD PERSONNEL DU CHORISTE ──
+  // ── TABLEAU DE BORD PERSONNEL DU CHORISTE (D + E) ──────────────
   renderChoriste(main) {
     const d = Store.data;
-    const membres = d.membres.filter(m => m.statut === 'Choriste' || m.statut === 'Intégrant');
-
-    // Message de motivation
-    const motMsg = Store.getMotivationMessageActif();
-
-    // Anniversaires du mois
+    const membreId = Permissions.choristeMembreId;
+    const m = membreId ? Store.getMembre(membreId) : null;
+    const membres = d.membres.filter(x => x.statut === 'Choriste' || x.statut === 'Intégrant');
     const now = new Date();
-    const annivMois = membres.filter(m => {
-      if (!m.dateNaissance) return false;
-      const dob = new Date(m.dateNaissance);
-      return dob.getMonth() === now.getMonth();
-    });
-    const annivAuj = annivMois.filter(m => {
-      const dob = new Date(m.dateNaissance);
-      return dob.getDate() === now.getDate();
-    });
 
-    // Prochaines activités (3 premières prévues)
+    // ── Données personnelles ──
+    const dis  = m ? Store.getDisciplineStats(m.id) : null;
+    const igi  = m ? Store.calcIGI(m.id) : null;
+    const year = d.meta.annee;
+
+    // Scores de classement personnels
+    const clsGlobal     = m ? Store.getClassement('global').find(r => r.membre.id === m.id) : null;
+    const clsMusical    = m ? Store.getClassement('musical').find(r => r.membre.id === m.id) : null;
+    const clsDiscipline = m ? Store.getClassement('discipline').find(r => r.membre.id === m.id) : null;
+    const clsTresorerie = m ? Store.getClassement('tresorerie').find(r => r.membre.id === m.id) : null;
+
+    // Cotisations personnelles
+    let totalDue = 0, totalPaid = 0, retards = 0;
+    const paiementsHist = [];
+    if (m) {
+      for (let mo = 1; mo <= 12; mo++) {
+        const mk = `${year}-${String(mo).padStart(2,'0')}`;
+        const due  = Store.getCotisationDue(m, mk);
+        const paid = Store.getCotisation(m.id, mk);
+        totalDue  += due;
+        totalPaid += paid;
+        if (due > 0 && paid < due) retards++;
+      }
+      // Historique des 6 derniers paiements validés
+      (d.paiements || [])
+        .filter(p => p.membreId === m.id && p.statut === 'Validé')
+        .sort((a,b) => (b.date||'').localeCompare(a.date||''))
+        .slice(0,6)
+        .forEach(p => paiementsHist.push(p));
+    }
+    const soldePersonnel = totalDue - totalPaid;
+
+    // Évaluations musicales personnelles
+    const evals = m
+      ? (d.evaluations || []).filter(e => e.membreId === m.id).sort((a,b) => (b.date||'').localeCompare(a.date||''))
+      : [];
+    const dernieresEvals = evals.slice(0, 5);
+    const moyEvals = evals.length
+      ? (evals.reduce((s,e) => s + Number(e.note||0), 0) / evals.length).toFixed(1)
+      : null;
+
+    // Sanctions personnelles
+    const sanctions = m
+      ? (d.sanctions || []).filter(s => s.membreId === m.id).sort((a,b) => (b.date||'').localeCompare(a.date||''))
+      : [];
+    const dernieresSanctions = sanctions.slice(0, 3);
+
+    // Répétitions : présences personnelles
+    const presReps = [];
+    if (m) {
+      (d.repetitions || []).forEach(rep => {
+        const pres = (rep.presences || {})[m.id];
+        if (pres !== undefined) presReps.push({ date: rep.date, statut: pres, type: rep.type });
+      });
+      presReps.sort((a,b) => (b.date||'').localeCompare(a.date||''));
+    }
+
+    // Bannières communes
+    const motMsg = Store.getMotivationMessageActif();
+    const notifsNonLues = Store.getNotifications({ lu: false });
+    const annivAuj = membres.filter(x => {
+      if (!x.dateNaissance) return false;
+      const dob = new Date(x.dateNaissance);
+      return dob.getMonth() === now.getMonth() && dob.getDate() === now.getDate();
+    });
     const activitesAVenir = Store.getActivites()
       .filter(a => a.statut === 'Prévue' && a.date >= Utils.todayISO())
-      .sort((a,b) => a.date.localeCompare(b.date)).slice(0,3);
-
-    // Prochaines prestations
+      .sort((a,b) => a.date.localeCompare(b.date)).slice(0, 3);
     const prestationsAVenir = (d.prestations || [])
       .filter(p => p.statut === 'Prévue' && p.date >= Utils.todayISO())
-      .sort((a,b) => a.date.localeCompare(b.date)).slice(0,2);
+      .sort((a,b) => a.date.localeCompare(b.date)).slice(0, 2);
+    const annivMois = membres.filter(x => {
+      if (!x.dateNaissance) return false;
+      return new Date(x.dateNaissance).getMonth() === now.getMonth();
+    });
 
-    // Notifications non lues
-    const notifsNonLues = Store.getNotifications({ lu: false });
+    const classementsPublies = Permissions.isAdmin() || Store.isClassementVisible();
+
+    // ── Score bar helper ──
+    const scoreBar = (score, color='var(--maroon)') => {
+      const pct = Math.min(100, Math.max(0, score||0));
+      return `<div style="background:var(--cream-deep);border-radius:99px;height:8px;margin-top:5px;overflow:hidden;">
+        <div style="background:${color};width:${pct}%;height:100%;border-radius:99px;transition:width .4s;"></div>
+      </div>`;
+    };
 
     main.innerHTML = `
-      <div class="card center" style="background:linear-gradient(135deg,var(--maroon) 0%,var(--maroon-dark) 100%);color:var(--cream);">
-        <div style="font-size:2.2rem;">🎵</div>
-        <div class="font-display mt-8" style="font-size:1.1rem;font-weight:700;color:var(--gold-soft);">Bienvenue dans votre espace</div>
-        <div class="text-sm mt-4" style="color:rgba(250,241,214,0.7);">Chorale Semeur de la Vérité Spirituelle</div>
+      <!-- ── Carte identité personnelle ── -->
+      <div class="card center" style="background:linear-gradient(135deg,var(--maroon) 0%,var(--maroon-dark) 100%);color:var(--cream);position:relative;">
+        <div style="font-size:2.4rem;margin-bottom:6px;">${m ? Utils.initials(m.nom) : '🎵'}</div>
+        <div class="font-display" style="font-size:1.15rem;font-weight:700;color:var(--gold-soft);">${m ? Utils.escapeHtml(m.nom) : 'Mon espace choriste'}</div>
+        <div class="text-sm mt-4" style="color:rgba(250,241,214,0.8);">${m ? (m.pupitre || m.fonction || 'Choriste') : 'Chorale SVS-EEI'}</div>
+        ${m ? `<div class="text-sm mt-4" style="color:rgba(250,241,214,0.6);">Matricule ${Utils.escapeHtml(m.id)} · Membre depuis ${Utils.fmtDate(m.dateEntree)}</div>` : ''}
+        ${dis && dis.interdit ? `<div style="margin-top:8px;background:var(--red);color:#fff;padding:4px 12px;border-radius:99px;font-size:0.78rem;font-weight:700;">⛔ Non autorisé à prester</div>` : ''}
       </div>
 
-      ${motMsg ? `
-        <div class="motivation-banner">
-          <div class="motivation-banner__icon">✨</div>
-          <div><div class="motivation-banner__text">${Utils.escapeHtml(motMsg.message)}</div><div class="motivation-banner__author">— ${Utils.escapeHtml(motMsg.auteur)}</div></div>
-        </div>
-      ` : ''}
+      ${motMsg ? `<div class="motivation-banner"><div class="motivation-banner__icon">✨</div><div><div class="motivation-banner__text">${Utils.escapeHtml(motMsg.message)}</div><div class="motivation-banner__author">— ${Utils.escapeHtml(motMsg.auteur)}</div></div></div>` : ''}
+      ${annivAuj.length ? `<div class="alert-banner gold"><div class="alert-banner__icon">🎉</div><div><b>Joyeux anniversaire !</b> ${annivAuj.map(x=>`🎂 ${Utils.escapeHtml(x.nom)}`).join(', ')}</div></div>` : ''}
+      ${notifsNonLues.length ? `<div class="alert-banner info" id="goto-notifs" style="cursor:pointer;"><div class="alert-banner__icon">🔔</div><div><b>${notifsNonLues.length} notification(s) non lue(s)</b> — Touchez pour consulter</div></div>` : ''}
 
-      ${annivAuj.length ? `
-        <div class="alert-banner gold">
-          <div class="alert-banner__icon">🎉</div>
-          <div><b>Joyeux anniversaire !</b><br>${annivAuj.map(m => `🎂 ${Utils.escapeHtml(m.nom)}`).join(', ')}<br><em style="font-size:0.78rem;">Que Dieu vous bénisse abondamment, vous accorde santé, paix et réussite. Toute la chorale vous souhaite une excellente année de vie.</em></div>
+      <!-- ══ E — MES PERFORMANCES ══ -->
+      <div class="section-title"><span class="ornament">📊</span> Mes performances</div>
+      ${m ? `
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+        <div class="card center" style="padding:12px 8px;">
+          <div class="text-sm text-muted">⚖️ Discipline</div>
+          <div class="font-display" style="font-size:1.5rem;font-weight:700;color:${clsDiscipline?'var(--maroon)':'var(--ink-soft)'};">${clsDiscipline ? clsDiscipline.score.toFixed(1) : '—'}<span style="font-size:0.75rem;color:var(--ink-soft);">/100</span></div>
+          ${clsDiscipline ? scoreBar(clsDiscipline.score) : ''}
+          ${clsDiscipline ? `<div class="text-sm text-muted mt-4">Rang ${clsDiscipline.rang}</div>` : ''}
         </div>
-      ` : ''}
-
-      ${notifsNonLues.length ? `
-        <div class="alert-banner info" id="goto-notifs" style="cursor:pointer;">
-          <div class="alert-banner__icon">🔔</div>
-          <div><b>${notifsNonLues.length} notification(s) non lue(s)</b> — Touchez pour consulter</div>
+        <div class="card center" style="padding:12px 8px;">
+          <div class="text-sm text-muted">💰 Trésorerie</div>
+          <div class="font-display" style="font-size:1.5rem;font-weight:700;color:${clsTresorerie?'var(--maroon)':'var(--ink-soft)'};">${clsTresorerie ? clsTresorerie.score.toFixed(1) : '—'}<span style="font-size:0.75rem;color:var(--ink-soft);">/100</span></div>
+          ${clsTresorerie ? scoreBar(clsTresorerie.score, 'var(--sage)') : ''}
+          ${clsTresorerie ? `<div class="text-sm text-muted mt-4">Rang ${clsTresorerie.rang}</div>` : ''}
         </div>
-      ` : ''}
+        <div class="card center" style="padding:12px 8px;grid-column:1/-1;">
+          <div class="text-sm text-muted">🎵 Direction Technique</div>
+          <div class="font-display" style="font-size:1.5rem;font-weight:700;color:${clsMusical?'var(--maroon)':'var(--ink-soft)'};">${clsMusical ? clsMusical.score.toFixed(1) : '—'}<span style="font-size:0.75rem;color:var(--ink-soft);">/100</span></div>
+          ${clsMusical ? scoreBar(clsMusical.score, 'var(--gold)') : ''}
+          ${clsMusical ? `<div class="text-sm text-muted mt-4">Rang ${clsMusical.rang} · Moy. évals : ${moyEvals||'—'}/20</div>` : ''}
+        </div>
+      </div>
+      ` : '<div class="card center text-sm text-muted">Compte non lié à une fiche membre — performances non disponibles.</div>'}
 
-      <div class="section-title"><span class="ornament">📅</span> Prochaines activités</div>
-      ${activitesAVenir.length ? `
-        <div class="list">
-          ${activitesAVenir.map(a => `
-            <div class="list-row" style="cursor:default;">
-              <div class="list-row__avatar">📅</div>
-              <div class="list-row__body">
-                <div class="list-row__title">${Utils.escapeHtml(a.type)}</div>
-                <div class="list-row__subtitle">${Utils.fmtDate(a.date)}${a.lieu?' · '+Utils.escapeHtml(a.lieu):''}</div>
-              </div>
-              <span class="pill bureau">Prévue</span>
+      <!-- ══ E — MA SITUATION ══ -->
+      <div class="section-title"><span class="ornament">📋</span> Ma situation</div>
+      ${m && dis ? `
+      <div class="card">
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Présences répétitions (Sam.)</span>
+          <span style="font-weight:700;color:${dis.txSamedi>=0.8?'var(--green)':'var(--red)'};">${Utils.pct(dis.txSamedi)} <span style="font-weight:400;color:var(--ink-soft);">(${dis.presentSamedi}/${dis.totalSamedi})</span></span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Absences consécutives</span>
+          <span style="font-weight:700;color:${dis.absencesConsecutives>=2?'var(--red)':'var(--ink)'};">${dis.absencesConsecutives}</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Sanctions / avertissements</span>
+          <span style="font-weight:700;color:${sanctions.length>0?'var(--amber)':'var(--green)'};">${sanctions.length}</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Cotisations dues (${year})</span>
+          <span style="font-weight:700;">${totalDue.toLocaleString()} FCFA</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Cotisations payées</span>
+          <span style="font-weight:700;color:var(--green);">${totalPaid.toLocaleString()} FCFA</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;">
+          <span class="text-sm text-muted">Reste à payer / solde</span>
+          <span style="font-weight:700;color:${soldePersonnel>0?'var(--red)':'var(--green)'};">${soldePersonnel>0?'+':''} ${soldePersonnel.toLocaleString()} FCFA</span>
+        </div>
+        ${dis.interdit ? `<div class="alert-banner danger mt-8"><div class="alert-banner__icon">⛔</div><div><b>Non autorisé à prester</b> — 2 absences consécutives aux répétitions</div></div>` : `<div class="alert-banner success mt-8"><div class="alert-banner__icon">✅</div><div>Autorisé à prester</div></div>`}
+      </div>
+      ` : '<div class="card center text-sm text-muted">Situation non disponible</div>'}
+
+      <!-- ══ E — MES CLASSEMENTS ══ -->
+      ${classementsPublies && m ? `
+      <div class="section-title"><span class="ornament">🏆</span> Mes classements</div>
+      <div class="card">
+        ${clsGlobal ? `<div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);"><span class="text-sm text-muted">🏆 Rang global</span><span style="font-weight:700;color:var(--maroon);">${ClassementsModule.medal(clsGlobal.rang)} ${clsGlobal.rang}e · ${clsGlobal.score.toFixed(1)}/100</span></div>` : ''}
+        ${clsDiscipline ? `<div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);"><span class="text-sm text-muted">⚖️ Rang discipline</span><span style="font-weight:700;">${ClassementsModule.medal(clsDiscipline.rang)} ${clsDiscipline.rang}e · ${clsDiscipline.score.toFixed(1)}/100</span></div>` : ''}
+        ${clsTresorerie ? `<div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);"><span class="text-sm text-muted">💰 Rang trésorerie</span><span style="font-weight:700;">${ClassementsModule.medal(clsTresorerie.rang)} ${clsTresorerie.rang}e · ${clsTresorerie.score.toFixed(1)}/100</span></div>` : ''}
+        ${clsMusical ? `<div class="flex-between" style="padding:7px 0;"><span class="text-sm text-muted">🎵 Rang musical</span><span style="font-weight:700;">${ClassementsModule.medal(clsMusical.rang)} ${clsMusical.rang}e · ${clsMusical.score.toFixed(1)}/100</span></div>` : ''}
+        ${(!clsGlobal && !clsDiscipline && !clsTresorerie && !clsMusical) ? '<div class="text-sm text-muted center">Aucune donnée de classement disponible</div>' : ''}
+        <button class="btn secondary block mt-12" data-nav="classements">🏆 Voir le classement complet</button>
+      </div>
+      ` : classementsPublies ? '' : `
+      <div class="section-title"><span class="ornament">🏆</span> Mes classements</div>
+      <div class="card center"><div class="text-sm text-muted">🔒 Les classements ne sont pas encore publiés</div></div>
+      `}
+
+      <!-- ══ E — HISTORIQUE ══ -->
+      ${m ? `
+      <div class="section-title"><span class="ornament">🕐</span> Historique récent</div>
+      <div class="card">
+        <!-- Dernières évaluations -->
+        ${dernieresEvals.length ? `
+          <div style="font-weight:700;font-size:0.88rem;color:var(--maroon);margin-bottom:6px;">🎵 Dernières évaluations</div>
+          ${dernieresEvals.map(e => `
+            <div class="flex-between" style="padding:5px 0;border-bottom:1px solid var(--line);">
+              <span class="text-sm">${Utils.fmtDate(e.date)} — ${Utils.escapeHtml(e.type||'Évaluation')}</span>
+              <span style="font-weight:700;color:${Number(e.note)>=10?'var(--green)':'var(--red)'};">${e.note}/20</span>
             </div>
           `).join('')}
-        </div>
-      ` : `<div class="card center text-sm text-muted">Aucune activité prévue prochainement</div>`}
+          <div class="text-sm text-muted mt-6">Moyenne globale : <b>${moyEvals||'—'}/20</b> sur ${evals.length} évaluation(s)</div>
+          <button class="btn secondary sm mt-8" id="btn-mes-evals">📋 Toutes mes évaluations</button>
+        ` : '<div class="text-sm text-muted">Aucune évaluation enregistrée</div>'}
+
+        ${dernieresSanctions.length ? `
+          <div style="font-weight:700;font-size:0.88rem;color:var(--amber);margin-top:14px;margin-bottom:6px;">⚖️ Dernières sanctions</div>
+          ${dernieresSanctions.map(s => `
+            <div class="flex-between" style="padding:5px 0;border-bottom:1px solid var(--line);">
+              <span class="text-sm">${Utils.fmtDate(s.date)} — ${Utils.escapeHtml(s.type||'Sanction')}</span>
+              <span class="pill danger" style="font-size:0.72rem;">${Utils.escapeHtml(s.niveau||'—')}</span>
+            </div>
+          `).join('')}
+        ` : ''}
+
+        ${paiementsHist.length ? `
+          <div style="font-weight:700;font-size:0.88rem;color:var(--sage);margin-top:14px;margin-bottom:6px;">💰 Derniers paiements</div>
+          ${paiementsHist.map(p => `
+            <div class="flex-between" style="padding:5px 0;border-bottom:1px solid var(--line);">
+              <span class="text-sm">${Utils.fmtDate(p.date)} — ${Utils.escapeHtml(p.monthKey||'')}</span>
+              <span style="font-weight:700;color:var(--green);">+${Number(p.montant||0).toLocaleString()} FCFA</span>
+            </div>
+          `).join('')}
+        ` : ''}
+      </div>
+
+      <!-- ══ D — ESPACE DÉTAILLÉ PAR MODULE ══ -->
+      <div class="section-title"><span class="ornament">🔍</span> Consulter mes données détaillées</div>
+      <div class="grid-2">
+        <button class="btn secondary block" id="btn-perso-discipline">⚖️ Discipline</button>
+        <button class="btn secondary block" id="btn-perso-tresorerie">💰 Trésorerie</button>
+        <button class="btn secondary block" id="btn-perso-direction" style="grid-column:1/-1;">🎵 Direction Technique</button>
+      </div>
+      ` : ''}
+
+      <!-- ══ ACTIVITÉS & PRESTATIONS À VENIR ══ -->
+      <div class="section-title"><span class="ornament">📅</span> Prochaines activités</div>
+      ${activitesAVenir.length ? `
+        <div class="list">${activitesAVenir.map(a => `
+          <div class="list-row" style="cursor:default;">
+            <div class="list-row__avatar">📅</div>
+            <div class="list-row__body">
+              <div class="list-row__title">${Utils.escapeHtml(a.type)}</div>
+              <div class="list-row__subtitle">${Utils.fmtDate(a.date)}${a.lieu?' · '+Utils.escapeHtml(a.lieu):''}</div>
+            </div>
+            <span class="pill bureau">Prévue</span>
+          </div>`).join('')}
+        </div>` : '<div class="card center text-sm text-muted">Aucune activité prévue prochainement</div>'}
 
       ${prestationsAVenir.length ? `
         <div class="section-title"><span class="ornament">🎤</span> Prochaines prestations</div>
-        <div class="list">
-          ${prestationsAVenir.map(p => `
-            <div class="list-row" style="cursor:default;">
-              <div class="list-row__avatar">🎤</div>
-              <div class="list-row__body">
-                <div class="list-row__title">${Utils.escapeHtml(p.type||'Prestation')}</div>
-                <div class="list-row__subtitle">${Utils.fmtDate(p.date)}${p.lieu?' · '+Utils.escapeHtml(p.lieu):''}</div>
-              </div>
+        <div class="list">${prestationsAVenir.map(p => `
+          <div class="list-row" style="cursor:default;">
+            <div class="list-row__avatar">🎤</div>
+            <div class="list-row__body">
+              <div class="list-row__title">${Utils.escapeHtml(p.type||'Prestation')}</div>
+              <div class="list-row__subtitle">${Utils.fmtDate(p.date)}${p.lieu?' · '+Utils.escapeHtml(p.lieu):''}</div>
             </div>
-          `).join('')}
-        </div>
-      ` : ''}
+          </div>`).join('')}
+        </div>` : ''}
 
       ${annivMois.length ? `
         <div class="section-title"><span class="ornament">🎂</span> Anniversaires du mois</div>
-        <div class="list">
-          ${annivMois.map(m => {
-            const dob = new Date(m.dateNaissance);
-            const isToday = dob.getDate() === now.getDate();
-            return `
-              <div class="list-row" style="cursor:default;${isToday?'background:var(--gold-soft);':''}">
-                <div class="list-row__avatar">${isToday?'🎉':'🎂'}</div>
-                <div class="list-row__body">
-                  <div class="list-row__title">${Utils.escapeHtml(m.nom)} ${isToday?'🎉':''}</div>
-                  <div class="list-row__subtitle">Le ${dob.getDate()} ${Utils.MONTHS[dob.getMonth()]}</div>
-                </div>
-              </div>
-            `;
-          }).join('')}
-        </div>
-      ` : ''}
+        <div class="list">${annivMois.map(x => {
+          const dob = new Date(x.dateNaissance);
+          const isToday = dob.getDate() === now.getDate();
+          return `<div class="list-row" style="cursor:default;${isToday?'background:var(--gold-soft);':''}">
+            <div class="list-row__avatar">${isToday?'🎉':'🎂'}</div>
+            <div class="list-row__body">
+              <div class="list-row__title">${Utils.escapeHtml(x.nom)} ${isToday?'🎉':''}</div>
+              <div class="list-row__subtitle">Le ${dob.getDate()} ${Utils.MONTHS[dob.getMonth()]}</div>
+            </div>
+          </div>`;
+        }).join('')}</div>` : ''}
 
+      <!-- ══ MES MODULES ══ -->
       <div class="section-title"><span class="ornament">⚡</span> Mes modules</div>
       <div class="grid-2">
         <button class="btn primary block" data-nav="anniversaires">🎂 Anniversaires</button>
@@ -3415,12 +3633,303 @@ const DashboardModule = {
       </div>
     `;
 
+    // ── Événements ──
     const gotoNotifs = main.querySelector('#goto-notifs');
     if (gotoNotifs) gotoNotifs.addEventListener('click', () => Router.navigate('notifications'));
 
     main.querySelectorAll('[data-nav]').forEach(btn => {
       btn.addEventListener('click', () => Router.navigate(btn.dataset.nav));
     });
+
+    // Détail évaluations
+    const btnEvals = main.querySelector('#btn-mes-evals');
+    if (btnEvals) btnEvals.addEventListener('click', () => this._choristeEvals(m, evals));
+
+    // Boutons espaces détaillés
+    const btnDiscipline = main.querySelector('#btn-perso-discipline');
+    if (btnDiscipline) btnDiscipline.addEventListener('click', () => this._choristeDetailDiscipline(m));
+    const btnTresorerie = main.querySelector('#btn-perso-tresorerie');
+    if (btnTresorerie) btnTresorerie.addEventListener('click', () => this._choristeDetailTresorerie(m, year));
+    const btnDirection = main.querySelector('#btn-perso-direction');
+    if (btnDirection) btnDirection.addEventListener('click', () => this._choristeDetailDirection(m, evals));
+  },
+
+  // ── D — Espace Discipline du choriste ──────────────────────────
+  _choristeDetailDiscipline(m) {
+    if (!m) return;
+    const dis = Store.getDisciplineStats(m.id);
+    const sanctions = (Store.data.sanctions || [])
+      .filter(s => s.membreId === m.id)
+      .sort((a,b) => (b.date||'').localeCompare(a.date||''));
+    const toges = (Store.data.toges || [])
+      .filter(t => t.membreId === m.id)
+      .sort((a,b) => (b.date||'').localeCompare(a.date||''));
+    const presReps = [];
+    (Store.data.repetitions || []).forEach(rep => {
+      const pres = (rep.presences || {})[m.id];
+      if (pres !== undefined) presReps.push({ date: rep.date, statut: pres, type: rep.type });
+    });
+    presReps.sort((a,b) => (b.date||'').localeCompare(a.date||''));
+
+    const html = `
+      <div class="card">
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Présences Sam. (répétitions)</span>
+          <span style="font-weight:700;color:${dis.txSamedi>=0.8?'var(--green)':'var(--red)'};">${Utils.pct(dis.txSamedi)} (${dis.presentSamedi}/${dis.totalSamedi})</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Présences Dim.</span>
+          <span style="font-weight:700;">${Utils.pct(dis.txDimanche)} (${dis.presentDimanche}/${dis.totalDimanche})</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Ponctualité</span>
+          <span style="font-weight:700;">${Utils.pct(dis.ponctualite)}</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Absences consécutives actuelles</span>
+          <span style="font-weight:700;color:${dis.absencesConsecutives>=2?'var(--red)':'var(--ink)'};">${dis.absencesConsecutives}</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Autorisation à prester</span>
+          <span style="font-weight:700;color:${dis.interdit?'var(--red)':'var(--green)'};">${dis.interdit ? '⛔ Non autorisé' : '✅ Autorisé'}</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;">
+          <span class="text-sm text-muted">Score discipline</span>
+          <span style="font-weight:700;color:var(--maroon);">${dis.score !== undefined ? dis.score.toFixed(1)+'/100' : '—'}</span>
+        </div>
+        ${dis.interdit ? `<div class="alert-banner danger mt-8"><div class="alert-banner__icon">⛔</div><div>Vous avez cumulé 2 absences consécutives aux répétitions du samedi. Votre autorisation de prester est suspendue jusqu'à votre prochaine présence.</div></div>` : ''}
+      </div>
+
+      <div class="section-title"><span class="ornament">📋</span> Historique des présences (${presReps.length} enregistrements)</div>
+      ${presReps.length ? `
+        <div class="list">${presReps.slice(0, 20).map(p => `
+          <div class="list-row" style="cursor:default;">
+            <div class="list-row__avatar" style="font-size:1rem;">${p.statut==='Présent'?'✅':p.statut==='En retard'?'⏰':'❌'}</div>
+            <div class="list-row__body">
+              <div class="list-row__title">${Utils.fmtDate(p.date)} — ${Utils.escapeHtml(p.type||'Répétition')}</div>
+              <div class="list-row__subtitle">${Utils.escapeHtml(p.statut)}</div>
+            </div>
+          </div>`).join('')}
+        </div>
+        ${presReps.length > 20 ? `<div class="text-sm text-muted center mt-8">+ ${presReps.length-20} entrées plus anciennes</div>` : ''}
+      ` : '<div class="card center text-sm text-muted">Aucune présence enregistrée</div>'}
+
+      ${sanctions.length ? `
+        <div class="section-title"><span class="ornament">⚠️</span> Mes sanctions (${sanctions.length})</div>
+        <div class="list">${sanctions.map(s => `
+          <div class="list-row" style="cursor:default;">
+            <div class="list-row__avatar" style="background:var(--red-soft);color:var(--red);font-size:0.85rem;">⚠️</div>
+            <div class="list-row__body">
+              <div class="list-row__title">${Utils.escapeHtml(s.type||'Sanction')}</div>
+              <div class="list-row__subtitle">${Utils.fmtDate(s.date)} · ${Utils.escapeHtml(s.niveau||'—')}${s.motif?' · '+Utils.escapeHtml(s.motif):''}</div>
+            </div>
+          </div>`).join('')}
+        </div>` : ''}
+
+      ${toges.length ? `
+        <div class="section-title"><span class="ornament">👘</span> Mes toges</div>
+        <div class="list">${toges.map(t => `
+          <div class="list-row" style="cursor:default;">
+            <div class="list-row__avatar">👘</div>
+            <div class="list-row__body">
+              <div class="list-row__title">${Utils.escapeHtml(t.type||'Toge')}</div>
+              <div class="list-row__subtitle">${Utils.fmtDate(t.date)}${t.observations?' · '+Utils.escapeHtml(t.observations):''}</div>
+            </div>
+            <span class="pill ${t.statut==='Rendu'?'actif':'bureau'}">${Utils.escapeHtml(t.statut||'—')}</span>
+          </div>`).join('')}
+        </div>` : ''}
+    `;
+    Utils.openSheet('⚖️ Ma Discipline', html);
+  },
+
+  // ── D — Espace Trésorerie du choriste ──────────────────────────
+  _choristeDetailTresorerie(m, year) {
+    if (!m) return;
+    const clsTreso = Store.getClassement('tresorerie').find(r => r.membre.id === m.id);
+    const moisLabels = ['Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc'];
+    const lignes = [];
+    let totalDue = 0, totalPaid = 0, retards = 0;
+    for (let mo = 1; mo <= 12; mo++) {
+      const mk = `${year}-${String(mo).padStart(2,'0')}`;
+      const due  = Store.getCotisationDue(m, mk);
+      const paid = Store.getCotisation(m.id, mk);
+      const stat = Store.getStatutPaiement(m.id, mk);
+      totalDue  += due;
+      totalPaid += paid;
+      if (due > 0 && paid < due) retards++;
+      lignes.push({ mois: moisLabels[mo-1], due, paid, stat: stat.statut, mk });
+    }
+    const solde = totalDue - totalPaid;
+
+    // Historique des paiements validés
+    const paiements = (Store.data.paiements || [])
+      .filter(p => p.membreId === m.id)
+      .sort((a,b) => (b.date||'').localeCompare(a.date||''));
+
+    // Sanctions financières
+    const sanctionsFinancieres = (Store.data.sanctions || [])
+      .filter(s => s.membreId === m.id && (s.type||'').toLowerCase().includes('financ'))
+      .sort((a,b) => (b.date||'').localeCompare(a.date||''));
+
+    const pillColor = s => s==='Payé'?'actif':s==='Partiel'?'bureau':'danger';
+
+    const html = `
+      <!-- Score & résumé -->
+      <div class="card center">
+        <div class="text-sm text-muted">Note financière (${year})</div>
+        <div class="font-display" style="font-size:2rem;font-weight:700;color:var(--maroon);">${clsTreso ? clsTreso.score.toFixed(1) : '—'}<span style="font-size:0.9rem;color:var(--ink-soft);">/100</span></div>
+        ${clsTreso ? `<div class="text-sm text-muted">Rang ${clsTreso.rang} · Taux cotis. : ${Utils.pct(clsTreso.detail.tauxCotis)} · Régularité : ${Utils.pct(clsTreso.detail.regularite)}</div>` : ''}
+      </div>
+
+      <div class="section-title"><span class="ornament">💳</span> Récapitulatif ${year}</div>
+      <div class="card">
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Total dû</span>
+          <span style="font-weight:700;">${totalDue.toLocaleString()} FCFA</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Total payé</span>
+          <span style="font-weight:700;color:var(--green);">${totalPaid.toLocaleString()} FCFA</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Solde personnel</span>
+          <span style="font-weight:700;color:${solde>0?'var(--red)':'var(--green)'};">${solde>0?solde.toLocaleString()+' FCFA à régler':'À jour ✅'}</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;">
+          <span class="text-sm text-muted">Mois en retard</span>
+          <span style="font-weight:700;color:${retards>0?'var(--amber)':'var(--green)'};">${retards}</span>
+        </div>
+      </div>
+
+      <div class="section-title"><span class="ornament">📅</span> Cotisations mois par mois</div>
+      <div class="list">${lignes.map(l => `
+        <div class="list-row" style="cursor:default;">
+          <div class="list-row__body">
+            <div class="list-row__title">${l.mois} ${year}</div>
+            <div class="list-row__subtitle">Dû : ${l.due.toLocaleString()} · Payé : ${l.paid.toLocaleString()} FCFA</div>
+          </div>
+          <span class="pill ${pillColor(l.stat)}">${l.stat}</span>
+        </div>`).join('')}
+      </div>
+
+      ${paiements.length ? `
+        <div class="section-title"><span class="ornament">💸</span> Historique des paiements (${paiements.length})</div>
+        <div class="list">${paiements.slice(0,20).map(p => `
+          <div class="list-row" style="cursor:default;">
+            <div class="list-row__avatar" style="background:var(--sage-soft);color:var(--sage);font-size:0.9rem;">💸</div>
+            <div class="list-row__body">
+              <div class="list-row__title">${Utils.fmtDate(p.date)} — ${Utils.escapeHtml(p.monthKey||'')}</div>
+              <div class="list-row__subtitle">${Utils.escapeHtml(p.statut||'')}${p.modePaiement?' · '+Utils.escapeHtml(p.modePaiement):''}</div>
+            </div>
+            <span style="font-weight:700;color:${p.statut==='Validé'?'var(--green)':'var(--amber)'};">+${Number(p.montant||0).toLocaleString()}</span>
+          </div>`).join('')}
+        </div>` : ''}
+
+      ${sanctionsFinancieres.length ? `
+        <div class="section-title"><span class="ornament">💢</span> Sanctions financières</div>
+        <div class="list">${sanctionsFinancieres.map(s => `
+          <div class="list-row" style="cursor:default;">
+            <div class="list-row__avatar" style="background:var(--red-soft);color:var(--red);">💢</div>
+            <div class="list-row__body">
+              <div class="list-row__title">${Utils.escapeHtml(s.type)}</div>
+              <div class="list-row__subtitle">${Utils.fmtDate(s.date)}${s.motif?' · '+Utils.escapeHtml(s.motif):''}</div>
+            </div>
+          </div>`).join('')}
+        </div>` : ''}
+    `;
+    Utils.openSheet('💰 Ma Trésorerie', html);
+  },
+
+  // ── D — Espace Direction Technique du choriste ─────────────────
+  _choristeDetailDirection(m, evals) {
+    if (!m) return;
+    const clsMus = Store.getClassement('musical').find(r => r.membre.id === m.id);
+    const hist   = Store.getClassementEvolution(m.id, 12);
+    const sparkValues = hist.map(h => h.musical);
+    const moyEvals = evals.length
+      ? (evals.reduce((s,e) => s + Number(e.note||0), 0) / evals.length).toFixed(1)
+      : null;
+
+    // Grouper par type d'évaluation
+    const parType = {};
+    evals.forEach(e => {
+      const t = e.type || 'Autre';
+      if (!parType[t]) parType[t] = [];
+      parType[t].push(e);
+    });
+
+    // Participations aux prestations
+    const prestPartic = [];
+    (Store.data.prestations || []).forEach(p => {
+      const pres = (p.presences || {})[m.id];
+      if (pres !== undefined) prestPartic.push({ date: p.date, type: p.type, statut: pres });
+    });
+    prestPartic.sort((a,b) => (b.date||'').localeCompare(a.date||''));
+
+    const html = `
+      <div class="card center">
+        <div class="text-sm text-muted">Score musical</div>
+        <div class="font-display" style="font-size:2rem;font-weight:700;color:var(--maroon);">${clsMus ? clsMus.score.toFixed(1) : '—'}<span style="font-size:0.9rem;color:var(--ink-soft);">/100</span></div>
+        ${clsMus ? `<div class="text-sm text-muted">Rang ${clsMus.rang} · Présences : ${Utils.pct(clsMus.detail.tauxAssiduite)} · Prestations : ${clsMus.detail.prestPresent}/${clsMus.detail.prestTotal||0}</div>` : ''}
+        ${moyEvals !== null ? `<div class="text-sm mt-4" style="font-weight:600;">Moyenne évaluations : <span style="color:${Number(moyEvals)>=10?'var(--green)':'var(--red)'};">${moyEvals}/20</span></div>` : ''}
+      </div>
+
+      ${hist.length ? `
+        <div class="section-title"><span class="ornament">📈</span> Mon évolution musicale</div>
+        <div class="card">
+          ${Utils.sparklineSVG(sparkValues, { color: '#1A4F8A' })}
+          <div class="text-sm text-muted center mt-8">${hist[0].monthKey} → ${hist[hist.length-1].monthKey}</div>
+        </div>` : ''}
+
+      <div class="section-title"><span class="ornament">🎓</span> Toutes mes évaluations (${evals.length})</div>
+      ${evals.length ? `
+        ${Object.entries(parType).map(([type, evs]) => `
+          <div class="card" style="margin-bottom:8px;">
+            <div style="font-weight:700;color:var(--maroon);margin-bottom:8px;">📋 ${Utils.escapeHtml(type)}</div>
+            ${evs.map(e => `
+              <div class="flex-between" style="padding:6px 0;border-bottom:1px solid var(--line);">
+                <div>
+                  <div class="text-sm" style="font-weight:600;">${Utils.fmtDate(e.date)}</div>
+                  ${e.appreciation ? `<div class="text-sm text-muted">"${Utils.escapeHtml(e.appreciation)}"</div>` : ''}
+                  ${e.evaluateur ? `<div class="text-sm text-muted">— ${Utils.escapeHtml(e.evaluateur)}</div>` : ''}
+                </div>
+                <span style="font-weight:700;font-size:1.1rem;color:${Number(e.note)>=10?'var(--green)':'var(--red)'};">${e.note}/20</span>
+              </div>`).join('')}
+            <div class="text-sm text-muted mt-6">Moy. ${type} : <b>${(evs.reduce((s,e)=>s+Number(e.note||0),0)/evs.length).toFixed(1)}/20</b></div>
+          </div>`).join('')}
+      ` : '<div class="card center text-sm text-muted">Aucune évaluation enregistrée</div>'}
+
+      ${prestPartic.length ? `
+        <div class="section-title"><span class="ornament">🎤</span> Mes participations aux prestations</div>
+        <div class="list">${prestPartic.map(p => `
+          <div class="list-row" style="cursor:default;">
+            <div class="list-row__avatar" style="font-size:0.9rem;">${p.statut==='Présent'?'✅':'❌'}</div>
+            <div class="list-row__body">
+              <div class="list-row__title">${Utils.fmtDate(p.date)} — ${Utils.escapeHtml(p.type||'Prestation')}</div>
+              <div class="list-row__subtitle">${Utils.escapeHtml(p.statut)}</div>
+            </div>
+          </div>`).join('')}
+        </div>` : ''}
+    `;
+    Utils.openSheet('🎵 Ma Direction Technique', html);
+  },
+
+  // ── Helper : toutes les évaluations d'un choriste ──────────────
+  _choristeEvals(m, evals) {
+    if (!m || !evals.length) return;
+    const html = `
+      <div class="text-sm text-muted" style="margin-bottom:10px;">${evals.length} évaluation(s) — Moyenne : <b>${(evals.reduce((s,e)=>s+Number(e.note||0),0)/evals.length).toFixed(1)}/20</b></div>
+      <div class="list">${evals.map(e => `
+        <div class="list-row" style="cursor:default;">
+          <div class="list-row__body">
+            <div class="list-row__title">${Utils.fmtDate(e.date)} — ${Utils.escapeHtml(e.type||'Évaluation')}</div>
+            ${e.appreciation ? `<div class="list-row__subtitle">"${Utils.escapeHtml(e.appreciation)}"${e.evaluateur?' — '+Utils.escapeHtml(e.evaluateur):''}</div>` : ''}
+          </div>
+          <span style="font-weight:700;font-size:1rem;color:${Number(e.note)>=10?'var(--green)':'var(--red)'};">${e.note}/20</span>
+        </div>`).join('')}
+      </div>
+    `;
+    Utils.openSheet('📋 Toutes mes évaluations', html);
   },
 
   // ── TABLEAU DE BORD BUREAU / ADMIN ──
@@ -3953,9 +4462,9 @@ const MembresModule = {
   openChangePasswordForm(m) {
     const html = `
       <div id="cp-error" class="auth-error" style="display:none;"></div>
-      <div class="field"><label>Mot de passe actuel</label><input type="password" id="cp-ancien" autocomplete="current-password"></div>
-      <div class="field"><label>Nouveau mot de passe</label><input type="password" id="cp-nouveau1" autocomplete="new-password" placeholder="Au moins 4 caractères"></div>
-      <div class="field"><label>Confirmez le nouveau mot de passe</label><input type="password" id="cp-nouveau2" autocomplete="new-password"></div>
+      <div class="field"><label>Mot de passe actuel</label>${Utils.pwdInput('cp-ancien','••••••••','current-password')}</div>
+      <div class="field"><label>Nouveau mot de passe</label>${Utils.pwdInput('cp-nouveau1','Au moins 4 caractères','new-password')}</div>
+      <div class="field"><label>Confirmez le nouveau mot de passe</label>${Utils.pwdInput('cp-nouveau2','••••••••','new-password')}</div>
       <button class="btn primary block" id="cp-save">🔑 Mettre à jour mon mot de passe</button>
     `;
     const sheet = Utils.openSheet('Changer mon mot de passe', html);
@@ -9055,7 +9564,11 @@ const ClassementsModule = {
     `;
 
     main.querySelectorAll('[data-tab]').forEach(btn => {
-      btn.addEventListener('click', () => { this.tab = btn.dataset.tab; this.render(main); });
+      btn.addEventListener('click', () => {
+        this.tab = btn.dataset.tab;
+        this._shownCount = 10; // reset pagination on tab switch
+        this.render(main);
+      });
     });
 
     this.renderCategorie(main.querySelector('#class-content'), this.tab);
@@ -9073,10 +9586,27 @@ const ClassementsModule = {
     const info = this.LABELS[cat];
     const avg = rows.length ? rows.reduce((s,r)=>s+r.score,0)/rows.length : 0;
 
+    // ── Visibilité des classements ──────────────────────────────────
+    // L'admin voit toujours tout. Les autres ne voient que si publié.
+    if (!Permissions.isAdmin() && !Store.isClassementVisible()) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-state__icon">🔒</div>
+          <div class="empty-state__text">Les classements ne sont pas encore publiés.<br>Revenez plus tard !</div>
+        </div>`;
+      return;
+    }
+
     if (!rows.length) {
       container.innerHTML = `<div class="empty-state"><div class="empty-state__icon">🏆</div><div class="empty-state__text">Aucun choriste à classer pour le moment</div></div>`;
       return;
     }
+
+    // Nombre de lignes visibles (pagination)
+    const PAGE = 10;
+    let shown = this._shownCount || PAGE;
+    const total = rows.length;
+    const visible = rows.slice(0, shown);
 
     container.innerHTML = `
       <div class="card center">
@@ -9086,9 +9616,9 @@ const ClassementsModule = {
         <div class="text-sm text-muted">Moyenne de la chorale</div>
       </div>
 
-      <div class="section-title"><span class="ornament">🏅</span> Top 10</div>
-      <div class="list">
-        ${rows.slice(0,10).map(r => `
+      <div class="section-title"><span class="ornament">🏅</span> Classement${shown < total ? ` — ${shown} sur ${total}` : ` complet (${total})`}</div>
+      <div class="list" id="class-list">
+        ${visible.map(r => `
           <div class="list-row" data-id="${r.membre.id}">
             <div class="list-row__avatar" style="${r.rang<=3?'background:var(--gold-soft);color:#8A6D10;font-size:1.1rem;':''}">${this.medal(r.rang)}</div>
             <div class="list-row__body">
@@ -9101,14 +9631,24 @@ const ClassementsModule = {
         `).join('')}
       </div>
 
-      ${rows.length > 10 ? `
-        <div class="text-sm text-muted center mt-16">+ ${rows.length-10} autre(s) choriste(s) classé(s)</div>
-      ` : ''}
+      ${shown < total ? `
+        <button class="btn secondary block mt-8" id="class-voir-plus" style="border-radius:var(--radius-m);">
+          ⬇️ Voir plus <span style="font-size:0.8em;opacity:0.7;">(${total - shown} restant${total - shown > 1 ? 's' : ''})</span>
+        </button>
+      ` : (total > PAGE ? `<div class="text-sm text-muted center mt-8">✅ Classement complet affiché (${total} membres)</div>` : '')}
     `;
 
     container.querySelectorAll('.list-row').forEach(row => {
       row.addEventListener('click', () => this.openDetail(row.dataset.id, cat));
     });
+
+    const voirPlusBtn = container.querySelector('#class-voir-plus');
+    if (voirPlusBtn) {
+      voirPlusBtn.addEventListener('click', () => {
+        this._shownCount = Math.min(shown + PAGE, total);
+        this.renderCategorie(container, cat);
+      });
+    }
   },
 
   openDetail(membreId, cat) {
@@ -9404,6 +9944,23 @@ const ParametresModule = {
 
       <div class="section-title"><span class="ornament">⚙️</span> Configuration</div>
       <div class="card">
+        ${isAdmin ? `
+        <!-- ── Publication des classements ── -->
+        <div class="flex-between" style="padding:10px 0;border-bottom:1px solid var(--line);align-items:center;">
+          <div>
+            <div style="font-weight:600;">🏆 Publication des classements</div>
+            <div class="text-sm text-muted">Rendre les classements visibles à tous les utilisateurs autorisés</div>
+          </div>
+          <label class="toggle-switch" title="${d.meta.classementVisible ? 'Classements publiés — cliquez pour masquer' : 'Classements masqués — cliquez pour publier'}">
+            <input type="checkbox" id="toggle-classement" ${d.meta.classementVisible ? 'checked' : ''}>
+            <span class="toggle-switch__slider"></span>
+          </label>
+        </div>
+        <div id="classement-status" class="text-sm mt-8" style="color:${d.meta.classementVisible ? 'var(--green)' : 'var(--ink-soft)'};">
+          ${d.meta.classementVisible ? '✅ Classements actuellement <b>publiés</b> (visibles par tous)' : '🔒 Classements actuellement <b>masqués</b> (visibles uniquement par l\'administrateur)'}
+        </div>
+        <div style="margin-top:16px;border-top:1px solid var(--line);padding-top:14px;"></div>
+        ` : ''}
         <div class="field">
           <label>Année de gestion</label>
           <input type="number" id="p-annee" value="${d.meta.annee}" min="2020" max="2100" ${isAdmin?'':'disabled'}>
@@ -9525,6 +10082,23 @@ const ParametresModule = {
       });
     }
 
+    // ── Toggle publication des classements ──
+    const toggleClassement = main.querySelector('#toggle-classement');
+    if (toggleClassement) {
+      toggleClassement.addEventListener('change', () => {
+        const on = toggleClassement.checked;
+        Store.setClassementVisible(on);
+        const statusEl = main.querySelector('#classement-status');
+        if (statusEl) {
+          statusEl.style.color = on ? 'var(--green)' : 'var(--ink-soft)';
+          statusEl.innerHTML = on
+            ? '✅ Classements actuellement <b>publiés</b> (visibles par tous)'
+            : '🔒 Classements actuellement <b>masqués</b> (visibles uniquement par l\'administrateur)';
+        }
+        Utils.toast(on ? '🏆 Classements publiés !' : '🔒 Classements masqués');
+      });
+    }
+
     main.querySelector('#logout-btn').addEventListener('click', () => {
       Utils.confirmAction('Se déconnecter ? Vous devrez ressaisir vos identifiants pour revenir.', () => {
         logout();
@@ -9569,15 +10143,15 @@ const ParametresModule = {
     const html = `
       <div class="field">
         <label>Mot de passe actuel</label>
-        <input type="password" id="cp-current" autocomplete="current-password">
+        ${Utils.pwdInput('cp-current', '••••••••', 'current-password')}
       </div>
       <div class="field">
         <label>Nouveau mot de passe</label>
-        <input type="password" id="cp-new" autocomplete="new-password" placeholder="6 caractères minimum">
+        ${Utils.pwdInput('cp-new', '6 caractères minimum', 'new-password')}
       </div>
       <div class="field">
         <label>Confirmer le nouveau mot de passe</label>
-        <input type="password" id="cp-confirm" autocomplete="new-password">
+        ${Utils.pwdInput('cp-confirm', '••••••••', 'new-password')}
       </div>
       <div id="cp-error" class="auth-error" style="display:none;"></div>
       <button class="btn primary block mt-8" id="cp-save">💾 Enregistrer le nouveau mot de passe</button>
@@ -9629,15 +10203,15 @@ const ParametresModule = {
       </div>
       <div class="field">
         <label>Mot de passe actuel du département</label>
-        <input type="password" id="dp-current" autocomplete="current-password">
+        ${Utils.pwdInput('dp-current', '••••••••', 'current-password')}
       </div>
       <div class="field">
         <label>Nouveau mot de passe</label>
-        <input type="password" id="dp-new" autocomplete="new-password" placeholder="6 caractères minimum">
+        ${Utils.pwdInput('dp-new', '6 caractères minimum', 'new-password')}
       </div>
       <div class="field">
         <label>Confirmer le nouveau mot de passe</label>
-        <input type="password" id="dp-confirm" autocomplete="new-password">
+        ${Utils.pwdInput('dp-confirm', '••••••••', 'new-password')}
       </div>
       <div id="dp-error" class="auth-error" style="display:none;"></div>
       <button class="btn primary block mt-8" id="dp-save">💾 Enregistrer</button>
