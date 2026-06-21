@@ -646,6 +646,9 @@ body {
   align-items: center;
   gap: 5px;
 }
+.sync-status-text #sync-label {
+  transition: color 0.3s;
+}
 
   </style>
 </head>
@@ -1103,34 +1106,146 @@ const STORAGE_KEY = 'chorale_erp_data_v1';
 const Store = {
   data: null,
   _ready: false,
+  _unsubscribe: null,      // listener onSnapshot actif
+  _remoteWrite: false,     // true pendant qu'on traite un snapshot entrant
+  _pendingSave: false,     // évite les sauvegardes en boucle
 
-  // Charge les données depuis le localStorage (ou initialise avec
-  // les données de base si c'est la première utilisation sur cet appareil).
+  // ════════════════════════════════════════════════════════════════
+  // INIT — charge localStorage immédiatement, puis attend l'événement
+  // 'firebase-ready' émis par firebase-config.js (module ES asynchrone).
+  // Résout le problème de timing type="module" vs DOMContentLoaded.
+  // ════════════════════════════════════════════════════════════════
   init() {
+    // ── 1. localStorage → affichage immédiat ─────────────────────
     let stored = null;
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) stored = JSON.parse(raw);
     } catch (e) {
-      console.warn('Lecture localStorage impossible, repli sur les données de base.', e);
+      console.warn('[Store] Lecture localStorage impossible.', e);
     }
-
-    if (stored) {
-      this.data = this._merge(structuredClone(SEED_DATA), stored);
-    } else {
-      this.data = structuredClone(SEED_DATA);
-    }
-
+    this.data = stored
+      ? this._merge(structuredClone(SEED_DATA), stored)
+      : structuredClone(SEED_DATA);
     this.recomputeAllCotisations_silent();
     this._ready = true;
-    this.save();
+    setSyncStatus('local');
+
+    // ── 2. Attendre Firebase (module ES chargé après DOMContentLoaded) ──
+    const connectWhenReady = () => {
+      const db = window.__firebase__ && window.__firebase__.db;
+      if (db) {
+        this._connectFirestore(db);
+      } else {
+        console.warn('[Store] firebase-ready reçu mais db absent.');
+        setSyncStatus('local');
+      }
+    };
+
+    if (window.__firebase__ && window.__firebase__.db) {
+      // Firebase déjà prêt (cas rare : rechargement rapide)
+      connectWhenReady();
+    } else {
+      // Cas normal : attendre l'événement custom
+      window.addEventListener('firebase-ready', connectWhenReady, { once: true });
+      // Sécurité : si Firebase ne répond pas en 10s → mode local définitif
+      setTimeout(() => {
+        if (!this._unsubscribe) {
+          console.warn('[Store] Firebase non reçu après 10s — mode local.');
+          setSyncStatus('local');
+          window.removeEventListener('firebase-ready', connectWhenReady);
+        }
+      }, 10000);
+    }
+
     return this.data;
+  },
+
+  // ── Connexion Firestore + listener onSnapshot temps réel ────────
+  _connectFirestore(db) {
+    setSyncStatus('connecting');
+    import('https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js')
+      .then(({ doc, setDoc, onSnapshot, serverTimestamp }) => {
+        const ref = doc(db, 'chorale-svs', 'data');
+
+        this._unsubscribe = onSnapshot(ref,
+          (snap) => {
+            if (snap.exists()) {
+              // Firestore a des données → source de vérité absolue
+              const remote = snap.data();
+              delete remote._updatedAt; // champ interne Firestore
+              this._remoteWrite = true;
+              this.data = this._merge(structuredClone(SEED_DATA), remote);
+              this.recomputeAllCotisations_silent();
+              try { localStorage.setItem(STORAGE_KEY, JSON.stringify(this.data)); } catch(e) {}
+              this._remoteWrite = false;
+              setSyncStatus('synced');
+              // Rafraîchir le module affiché pour tous les utilisateurs
+              if (typeof Router !== 'undefined' && Router.current) {
+                try { Router.render(Router.current); } catch(e) {}
+              }
+              console.info('[Store] ☁️ Données Firestore appliquées.');
+            } else {
+              // Firestore vide → migrer localStorage vers Firestore
+              console.info('[Store] Firestore vide — migration en cours…');
+              setSyncStatus('uploading');
+              const payload = Object.assign({}, this.data, { _updatedAt: serverTimestamp() });
+              setDoc(ref, payload)
+                .then(() => { setSyncStatus('synced'); console.info('[Store] ✅ Migration Firestore réussie.'); })
+                .catch(err  => { setSyncStatus('error'); console.error('[Store] ❌ Erreur migration :', err); });
+            }
+          },
+          (err) => {
+            console.error('[Store] ❌ Erreur onSnapshot :', err);
+            setSyncStatus('error');
+          }
+        );
+      })
+      .catch(err => {
+        console.error('[Store] Import Firestore échoué :', err);
+        setSyncStatus('local');
+      });
+  },
+
+  // ════════════════════════════════════════════════════════════════
+  // SAVE — localStorage immédiat + Firestore asynchrone.
+  // Les écritures déclenchées par onSnapshot sont ignorées (_remoteWrite)
+  // pour éviter les boucles infinies.
+  // ════════════════════════════════════════════════════════════════
+  save() {
+    if (!this._ready) return;
+    if (this._remoteWrite) return;
+
+    this.data.meta.lastUpdate = new Date().toISOString();
+
+    // Toujours écrire dans localStorage (cache hors-ligne)
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.data));
+    } catch (e) {
+      console.error('[Store] Erreur localStorage :', e);
+      Utils.toast('⚠️ Erreur d\'enregistrement local — espace de stockage plein ?');
+    }
+
+    // Écrire dans Firestore si connecté
+    const db = window.__firebase__ && window.__firebase__.db;
+    if (!db) { setSyncStatus('local'); return; }
+
+    setSyncStatus('saving');
+    import('https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js')
+      .then(({ doc, setDoc, serverTimestamp }) => {
+        const payload = Object.assign({}, this.data, { _updatedAt: serverTimestamp() });
+        return setDoc(doc(db, 'chorale-svs', 'data'), payload);
+      })
+      .then(() => setSyncStatus('synced'))
+      .catch(err => {
+        console.error('[Store] Erreur écriture Firestore :', err);
+        setSyncStatus('error');
+      });
   },
 
   // Deep-ish merge: ensures new fields from SEED_DATA exist, but stored data wins
   _merge(base, remote) {
     const out = Object.assign({}, base, remote);
-    // Ensure nested objects exist even if remote omitted them
     for (const key of Object.keys(base)) {
       if (remote[key] === undefined) out[key] = base[key];
       else if (
@@ -1141,19 +1256,6 @@ const Store = {
       }
     }
     return out;
-  },
-
-  // Écrit immédiatement l'état courant dans le localStorage du navigateur.
-  save() {
-    if (!this._ready) return;
-    try {
-      this.data.meta.lastUpdate = new Date().toISOString();
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(this.data));
-      setSyncStatus && setSyncStatus('synced');
-    } catch (e) {
-      console.error('Erreur d\'enregistrement local (localStorage plein ou indisponible)', e);
-      Utils.toast('⚠️ Erreur d\'enregistrement local — l\'espace de stockage du navigateur est peut-être plein');
-    }
   },
 
   // Recalcule les cotisations sans déclencher une écriture (utilisé au chargement,
@@ -3355,6 +3457,65 @@ const DashboardModule = {
 
   // ── TABLEAU DE BORD PERSONNEL DU CHORISTE (D + E) ──────────────
   renderChoriste(main) {
+    try {
+      this._renderChoristeInner(main);
+    } catch(err) {
+      console.error('[Dashboard] Erreur renderChoriste :', err);
+      // Affiche quand même l'accueil communautaire de base en cas d'erreur
+      this._renderChoristeMinimal(main);
+    }
+  },
+
+  // Accueil minimal garanti (sans données personnelles, sans classements)
+  _renderChoristeMinimal(main) {
+    const d = Store.data;
+    const membres = d.membres.filter(x => x.statut === 'Choriste' || x.statut === 'Intégrant');
+    const now = new Date();
+    const motMsg = Store.getMotivationMessageActif ? Store.getMotivationMessageActif() : null;
+    const notifsNonLues = Store.getNotifications ? Store.getNotifications({ lu: false }) : [];
+    const annivAuj = membres.filter(x => {
+      if (!x.dateNaissance) return false;
+      const dob = new Date(x.dateNaissance);
+      return dob.getMonth() === now.getMonth() && dob.getDate() === now.getDate();
+    });
+    const activitesAVenir = Store.getActivites
+      ? Store.getActivites().filter(a => a.statut === 'Prévue' && a.date >= Utils.todayISO()).sort((a,b) => a.date.localeCompare(b.date)).slice(0,3)
+      : [];
+    const annivMois = membres.filter(x => {
+      if (!x.dateNaissance) return false;
+      return new Date(x.dateNaissance).getMonth() === now.getMonth();
+    });
+
+    main.innerHTML = `
+      <div class="card center" style="background:linear-gradient(135deg,var(--maroon) 0%,var(--maroon-dark) 100%);color:var(--cream);">
+        <div style="font-size:2.4rem;margin-bottom:6px;">🎵</div>
+        <div class="font-display" style="font-size:1.15rem;font-weight:700;color:var(--gold-soft);">Bienvenue dans votre espace</div>
+        <div class="text-sm mt-4" style="color:rgba(250,241,214,0.8);">Chorale Semeur de la Vérité Spirituelle</div>
+      </div>
+      ${motMsg ? `<div class="motivation-banner"><div class="motivation-banner__icon">✨</div><div><div class="motivation-banner__text">${Utils.escapeHtml(motMsg.message)}</div><div class="motivation-banner__author">— ${Utils.escapeHtml(motMsg.auteur)}</div></div></div>` : ''}
+      ${annivAuj.length ? `<div class="alert-banner gold"><div class="alert-banner__icon">🎉</div><div><b>Joyeux anniversaire !</b> ${annivAuj.map(x=>`🎂 ${Utils.escapeHtml(x.nom)}`).join(', ')}</div></div>` : ''}
+      ${notifsNonLues.length ? `<div class="alert-banner info" id="goto-notifs" style="cursor:pointer;"><div class="alert-banner__icon">🔔</div><div><b>${notifsNonLues.length} notification(s) non lue(s)</b> — Touchez pour consulter</div></div>` : ''}
+      <div class="section-title"><span class="ornament">📅</span> Prochaines activités</div>
+      ${activitesAVenir.length ? `<div class="list">${activitesAVenir.map(a=>`<div class="list-row" style="cursor:default;"><div class="list-row__avatar">📅</div><div class="list-row__body"><div class="list-row__title">${Utils.escapeHtml(a.type)}</div><div class="list-row__subtitle">${Utils.fmtDate(a.date)}</div></div><span class="pill bureau">Prévue</span></div>`).join('')}</div>` : '<div class="card center text-sm text-muted">Aucune activité prévue prochainement</div>'}
+      ${annivMois.length ? `<div class="section-title"><span class="ornament">🎂</span> Anniversaires du mois</div><div class="list">${annivMois.map(x=>{const dob=new Date(x.dateNaissance);const isToday=dob.getDate()===now.getDate();return`<div class="list-row" style="cursor:default;${isToday?'background:var(--gold-soft);':''}"><div class="list-row__avatar">${isToday?'🎉':'🎂'}</div><div class="list-row__body"><div class="list-row__title">${Utils.escapeHtml(x.nom)}</div><div class="list-row__subtitle">Le ${dob.getDate()} ${Utils.MONTHS[dob.getMonth()]}</div></div></div>`;}).join('')}</div>` : ''}
+      <div class="section-title"><span class="ornament">⚡</span> Mes modules</div>
+      <div class="grid-2">
+        <button class="btn primary block" data-nav="anniversaires">🎂 Anniversaires</button>
+        <button class="btn gold block" data-nav="notifications">🔔 Notifications</button>
+        <button class="btn secondary block" data-nav="classements">🏆 Classements</button>
+        <button class="btn sage block" data-nav="prestations">🎤 Prestations</button>
+        <button class="btn secondary block" data-nav="repetitions">🎹 Répétitions</button>
+        <button class="btn sage block" data-nav="suggestions">💡 Suggestions</button>
+      </div>
+    `;
+    const gotoNotifs = main.querySelector('#goto-notifs');
+    if (gotoNotifs) gotoNotifs.addEventListener('click', () => Router.navigate('notifications'));
+    main.querySelectorAll('[data-nav]').forEach(btn => {
+      btn.addEventListener('click', () => Router.navigate(btn.dataset.nav));
+    });
+  },
+
+  _renderChoristeInner(main) {
     const d = Store.data;
     const membreId = Permissions.choristeMembreId;
     const m = membreId ? Store.getMembre(membreId) : null;
@@ -3366,11 +3527,15 @@ const DashboardModule = {
     const igi  = m ? Store.calcIGI(m.id) : null;
     const year = d.meta.annee;
 
-    // Scores de classement personnels
-    const clsGlobal     = m ? Store.getClassement('global').find(r => r.membre.id === m.id) : null;
-    const clsMusical    = m ? Store.getClassement('musical').find(r => r.membre.id === m.id) : null;
-    const clsDiscipline = m ? Store.getClassement('discipline').find(r => r.membre.id === m.id) : null;
-    const clsTresorerie = m ? Store.getClassement('tresorerie').find(r => r.membre.id === m.id) : null;
+    // Scores de classement personnels (sécurisés contre les exceptions)
+    const _safeClassement = (cat) => {
+      try { return m ? Store.getClassement(cat).find(r => r.membre.id === m.id) || null : null; }
+      catch(e) { return null; }
+    };
+    const clsGlobal     = _safeClassement('global');
+    const clsMusical    = _safeClassement('musical');
+    const clsDiscipline = _safeClassement('discipline');
+    const clsTresorerie = _safeClassement('tresorerie');
 
     // Cotisations personnelles
     let totalDue = 0, totalPaid = 0, retards = 0;
@@ -3451,137 +3616,17 @@ const DashboardModule = {
       <!-- ── Carte identité personnelle ── -->
       <div class="card center" style="background:linear-gradient(135deg,var(--maroon) 0%,var(--maroon-dark) 100%);color:var(--cream);position:relative;">
         <div style="font-size:2.4rem;margin-bottom:6px;">${m ? Utils.initials(m.nom) : '🎵'}</div>
-        <div class="font-display" style="font-size:1.15rem;font-weight:700;color:var(--gold-soft);">${m ? Utils.escapeHtml(m.nom) : 'Mon espace choriste'}</div>
-        <div class="text-sm mt-4" style="color:rgba(250,241,214,0.8);">${m ? (m.pupitre || m.fonction || 'Choriste') : 'Chorale SVS-EEI'}</div>
+        <div class="font-display" style="font-size:1.15rem;font-weight:700;color:var(--gold-soft);">${m ? Utils.escapeHtml(m.nom) : 'Bienvenue dans votre espace'}</div>
+        <div class="text-sm mt-4" style="color:rgba(250,241,214,0.8);">${m ? (m.pupitre || m.fonction || 'Choriste') : 'Chorale Semeur de la Vérité Spirituelle'}</div>
         ${m ? `<div class="text-sm mt-4" style="color:rgba(250,241,214,0.6);">Matricule ${Utils.escapeHtml(m.id)} · Membre depuis ${Utils.fmtDate(m.dateEntree)}</div>` : ''}
         ${dis && dis.interdit ? `<div style="margin-top:8px;background:var(--red);color:#fff;padding:4px 12px;border-radius:99px;font-size:0.78rem;font-weight:700;">⛔ Non autorisé à prester</div>` : ''}
       </div>
 
+      <!-- ══ INFOS COMMUNAUTAIRES (toujours visibles) ══ -->
       ${motMsg ? `<div class="motivation-banner"><div class="motivation-banner__icon">✨</div><div><div class="motivation-banner__text">${Utils.escapeHtml(motMsg.message)}</div><div class="motivation-banner__author">— ${Utils.escapeHtml(motMsg.auteur)}</div></div></div>` : ''}
-      ${annivAuj.length ? `<div class="alert-banner gold"><div class="alert-banner__icon">🎉</div><div><b>Joyeux anniversaire !</b> ${annivAuj.map(x=>`🎂 ${Utils.escapeHtml(x.nom)}`).join(', ')}</div></div>` : ''}
+      ${annivAuj.length ? `<div class="alert-banner gold"><div class="alert-banner__icon">🎉</div><div><b>Joyeux anniversaire !</b> ${annivAuj.map(x=>`🎂 ${Utils.escapeHtml(x.nom)}`).join(', ')}<br><em style="font-size:0.78rem;">Que Dieu vous bénisse abondamment. Toute la chorale vous souhaite une excellente année !</em></div></div>` : ''}
       ${notifsNonLues.length ? `<div class="alert-banner info" id="goto-notifs" style="cursor:pointer;"><div class="alert-banner__icon">🔔</div><div><b>${notifsNonLues.length} notification(s) non lue(s)</b> — Touchez pour consulter</div></div>` : ''}
 
-      <!-- ══ E — MES PERFORMANCES ══ -->
-      <div class="section-title"><span class="ornament">📊</span> Mes performances</div>
-      ${m ? `
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-        <div class="card center" style="padding:12px 8px;">
-          <div class="text-sm text-muted">⚖️ Discipline</div>
-          <div class="font-display" style="font-size:1.5rem;font-weight:700;color:${clsDiscipline?'var(--maroon)':'var(--ink-soft)'};">${clsDiscipline ? clsDiscipline.score.toFixed(1) : '—'}<span style="font-size:0.75rem;color:var(--ink-soft);">/100</span></div>
-          ${clsDiscipline ? scoreBar(clsDiscipline.score) : ''}
-          ${clsDiscipline ? `<div class="text-sm text-muted mt-4">Rang ${clsDiscipline.rang}</div>` : ''}
-        </div>
-        <div class="card center" style="padding:12px 8px;">
-          <div class="text-sm text-muted">💰 Trésorerie</div>
-          <div class="font-display" style="font-size:1.5rem;font-weight:700;color:${clsTresorerie?'var(--maroon)':'var(--ink-soft)'};">${clsTresorerie ? clsTresorerie.score.toFixed(1) : '—'}<span style="font-size:0.75rem;color:var(--ink-soft);">/100</span></div>
-          ${clsTresorerie ? scoreBar(clsTresorerie.score, 'var(--sage)') : ''}
-          ${clsTresorerie ? `<div class="text-sm text-muted mt-4">Rang ${clsTresorerie.rang}</div>` : ''}
-        </div>
-        <div class="card center" style="padding:12px 8px;grid-column:1/-1;">
-          <div class="text-sm text-muted">🎵 Direction Technique</div>
-          <div class="font-display" style="font-size:1.5rem;font-weight:700;color:${clsMusical?'var(--maroon)':'var(--ink-soft)'};">${clsMusical ? clsMusical.score.toFixed(1) : '—'}<span style="font-size:0.75rem;color:var(--ink-soft);">/100</span></div>
-          ${clsMusical ? scoreBar(clsMusical.score, 'var(--gold)') : ''}
-          ${clsMusical ? `<div class="text-sm text-muted mt-4">Rang ${clsMusical.rang} · Moy. évals : ${moyEvals||'—'}/20</div>` : ''}
-        </div>
-      </div>
-      ` : '<div class="card center text-sm text-muted">Compte non lié à une fiche membre — performances non disponibles.</div>'}
-
-      <!-- ══ E — MA SITUATION ══ -->
-      <div class="section-title"><span class="ornament">📋</span> Ma situation</div>
-      ${m && dis ? `
-      <div class="card">
-        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
-          <span class="text-sm text-muted">Présences répétitions (Sam.)</span>
-          <span style="font-weight:700;color:${dis.txSamedi>=0.8?'var(--green)':'var(--red)'};">${Utils.pct(dis.txSamedi)} <span style="font-weight:400;color:var(--ink-soft);">(${dis.presentSamedi}/${dis.totalSamedi})</span></span>
-        </div>
-        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
-          <span class="text-sm text-muted">Absences consécutives</span>
-          <span style="font-weight:700;color:${dis.absencesConsecutives>=2?'var(--red)':'var(--ink)'};">${dis.absencesConsecutives}</span>
-        </div>
-        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
-          <span class="text-sm text-muted">Sanctions / avertissements</span>
-          <span style="font-weight:700;color:${sanctions.length>0?'var(--amber)':'var(--green)'};">${sanctions.length}</span>
-        </div>
-        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
-          <span class="text-sm text-muted">Cotisations dues (${year})</span>
-          <span style="font-weight:700;">${totalDue.toLocaleString()} FCFA</span>
-        </div>
-        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
-          <span class="text-sm text-muted">Cotisations payées</span>
-          <span style="font-weight:700;color:var(--green);">${totalPaid.toLocaleString()} FCFA</span>
-        </div>
-        <div class="flex-between" style="padding:7px 0;">
-          <span class="text-sm text-muted">Reste à payer / solde</span>
-          <span style="font-weight:700;color:${soldePersonnel>0?'var(--red)':'var(--green)'};">${soldePersonnel>0?'+':''} ${soldePersonnel.toLocaleString()} FCFA</span>
-        </div>
-        ${dis.interdit ? `<div class="alert-banner danger mt-8"><div class="alert-banner__icon">⛔</div><div><b>Non autorisé à prester</b> — 2 absences consécutives aux répétitions</div></div>` : `<div class="alert-banner success mt-8"><div class="alert-banner__icon">✅</div><div>Autorisé à prester</div></div>`}
-      </div>
-      ` : '<div class="card center text-sm text-muted">Situation non disponible</div>'}
-
-      <!-- ══ E — MES CLASSEMENTS ══ -->
-      ${classementsPublies && m ? `
-      <div class="section-title"><span class="ornament">🏆</span> Mes classements</div>
-      <div class="card">
-        ${clsGlobal ? `<div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);"><span class="text-sm text-muted">🏆 Rang global</span><span style="font-weight:700;color:var(--maroon);">${ClassementsModule.medal(clsGlobal.rang)} ${clsGlobal.rang}e · ${clsGlobal.score.toFixed(1)}/100</span></div>` : ''}
-        ${clsDiscipline ? `<div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);"><span class="text-sm text-muted">⚖️ Rang discipline</span><span style="font-weight:700;">${ClassementsModule.medal(clsDiscipline.rang)} ${clsDiscipline.rang}e · ${clsDiscipline.score.toFixed(1)}/100</span></div>` : ''}
-        ${clsTresorerie ? `<div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);"><span class="text-sm text-muted">💰 Rang trésorerie</span><span style="font-weight:700;">${ClassementsModule.medal(clsTresorerie.rang)} ${clsTresorerie.rang}e · ${clsTresorerie.score.toFixed(1)}/100</span></div>` : ''}
-        ${clsMusical ? `<div class="flex-between" style="padding:7px 0;"><span class="text-sm text-muted">🎵 Rang musical</span><span style="font-weight:700;">${ClassementsModule.medal(clsMusical.rang)} ${clsMusical.rang}e · ${clsMusical.score.toFixed(1)}/100</span></div>` : ''}
-        ${(!clsGlobal && !clsDiscipline && !clsTresorerie && !clsMusical) ? '<div class="text-sm text-muted center">Aucune donnée de classement disponible</div>' : ''}
-        <button class="btn secondary block mt-12" data-nav="classements">🏆 Voir le classement complet</button>
-      </div>
-      ` : classementsPublies ? '' : `
-      <div class="section-title"><span class="ornament">🏆</span> Mes classements</div>
-      <div class="card center"><div class="text-sm text-muted">🔒 Les classements ne sont pas encore publiés</div></div>
-      `}
-
-      <!-- ══ E — HISTORIQUE ══ -->
-      ${m ? `
-      <div class="section-title"><span class="ornament">🕐</span> Historique récent</div>
-      <div class="card">
-        <!-- Dernières évaluations -->
-        ${dernieresEvals.length ? `
-          <div style="font-weight:700;font-size:0.88rem;color:var(--maroon);margin-bottom:6px;">🎵 Dernières évaluations</div>
-          ${dernieresEvals.map(e => `
-            <div class="flex-between" style="padding:5px 0;border-bottom:1px solid var(--line);">
-              <span class="text-sm">${Utils.fmtDate(e.date)} — ${Utils.escapeHtml(e.type||'Évaluation')}</span>
-              <span style="font-weight:700;color:${Number(e.note)>=10?'var(--green)':'var(--red)'};">${e.note}/20</span>
-            </div>
-          `).join('')}
-          <div class="text-sm text-muted mt-6">Moyenne globale : <b>${moyEvals||'—'}/20</b> sur ${evals.length} évaluation(s)</div>
-          <button class="btn secondary sm mt-8" id="btn-mes-evals">📋 Toutes mes évaluations</button>
-        ` : '<div class="text-sm text-muted">Aucune évaluation enregistrée</div>'}
-
-        ${dernieresSanctions.length ? `
-          <div style="font-weight:700;font-size:0.88rem;color:var(--amber);margin-top:14px;margin-bottom:6px;">⚖️ Dernières sanctions</div>
-          ${dernieresSanctions.map(s => `
-            <div class="flex-between" style="padding:5px 0;border-bottom:1px solid var(--line);">
-              <span class="text-sm">${Utils.fmtDate(s.date)} — ${Utils.escapeHtml(s.type||'Sanction')}</span>
-              <span class="pill danger" style="font-size:0.72rem;">${Utils.escapeHtml(s.niveau||'—')}</span>
-            </div>
-          `).join('')}
-        ` : ''}
-
-        ${paiementsHist.length ? `
-          <div style="font-weight:700;font-size:0.88rem;color:var(--sage);margin-top:14px;margin-bottom:6px;">💰 Derniers paiements</div>
-          ${paiementsHist.map(p => `
-            <div class="flex-between" style="padding:5px 0;border-bottom:1px solid var(--line);">
-              <span class="text-sm">${Utils.fmtDate(p.date)} — ${Utils.escapeHtml(p.monthKey||'')}</span>
-              <span style="font-weight:700;color:var(--green);">+${Number(p.montant||0).toLocaleString()} FCFA</span>
-            </div>
-          `).join('')}
-        ` : ''}
-      </div>
-
-      <!-- ══ D — ESPACE DÉTAILLÉ PAR MODULE ══ -->
-      <div class="section-title"><span class="ornament">🔍</span> Consulter mes données détaillées</div>
-      <div class="grid-2">
-        <button class="btn secondary block" id="btn-perso-discipline">⚖️ Discipline</button>
-        <button class="btn secondary block" id="btn-perso-tresorerie">💰 Trésorerie</button>
-        <button class="btn secondary block" id="btn-perso-direction" style="grid-column:1/-1;">🎵 Direction Technique</button>
-      </div>
-      ` : ''}
-
-      <!-- ══ ACTIVITÉS & PRESTATIONS À VENIR ══ -->
       <div class="section-title"><span class="ornament">📅</span> Prochaines activités</div>
       ${activitesAVenir.length ? `
         <div class="list">${activitesAVenir.map(a => `
@@ -3631,6 +3676,113 @@ const DashboardModule = {
         <button class="btn secondary block" data-nav="repetitions">🎹 Répétitions</button>
         <button class="btn sage block" data-nav="suggestions">💡 Suggestions</button>
       </div>
+
+      <!-- ══ MES PERFORMANCES (si lié à une fiche membre) ══ -->
+      ${m ? `
+      <div class="section-title"><span class="ornament">📊</span> Mes performances</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+        <div class="card center" style="padding:12px 8px;">
+          <div class="text-sm text-muted">⚖️ Discipline</div>
+          <div class="font-display" style="font-size:1.5rem;font-weight:700;color:${clsDiscipline?'var(--maroon)':'var(--ink-soft)'};">${clsDiscipline ? clsDiscipline.score.toFixed(1) : '—'}<span style="font-size:0.75rem;color:var(--ink-soft);">/100</span></div>
+          ${clsDiscipline ? scoreBar(clsDiscipline.score) : ''}
+          ${clsDiscipline ? `<div class="text-sm text-muted mt-4">Rang ${clsDiscipline.rang}</div>` : ''}
+        </div>
+        <div class="card center" style="padding:12px 8px;">
+          <div class="text-sm text-muted">💰 Trésorerie</div>
+          <div class="font-display" style="font-size:1.5rem;font-weight:700;color:${clsTresorerie?'var(--maroon)':'var(--ink-soft)'};">${clsTresorerie ? clsTresorerie.score.toFixed(1) : '—'}<span style="font-size:0.75rem;color:var(--ink-soft);">/100</span></div>
+          ${clsTresorerie ? scoreBar(clsTresorerie.score, 'var(--sage)') : ''}
+          ${clsTresorerie ? `<div class="text-sm text-muted mt-4">Rang ${clsTresorerie.rang}</div>` : ''}
+        </div>
+        <div class="card center" style="padding:12px 8px;grid-column:1/-1;">
+          <div class="text-sm text-muted">🎵 Direction Technique</div>
+          <div class="font-display" style="font-size:1.5rem;font-weight:700;color:${clsMusical?'var(--maroon)':'var(--ink-soft)'};">${clsMusical ? clsMusical.score.toFixed(1) : '—'}<span style="font-size:0.75rem;color:var(--ink-soft);">/100</span></div>
+          ${clsMusical ? scoreBar(clsMusical.score, 'var(--gold)') : ''}
+          ${clsMusical ? `<div class="text-sm text-muted mt-4">Rang ${clsMusical.rang} · Moy. évals : ${moyEvals||'—'}/20</div>` : ''}
+        </div>
+      </div>
+
+      <!-- ══ MA SITUATION ══ -->
+      <div class="section-title"><span class="ornament">📋</span> Ma situation</div>
+      ${dis ? `
+      <div class="card">
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Présences répétitions (Sam.)</span>
+          <span style="font-weight:700;color:${dis.txSamedi>=0.8?'var(--green)':'var(--red)'};">${Utils.pct(dis.txSamedi)} <span style="font-weight:400;color:var(--ink-soft);">(${dis.presentSamedi}/${dis.totalSamedi})</span></span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Absences consécutives</span>
+          <span style="font-weight:700;color:${dis.absencesConsecutives>=2?'var(--red)':'var(--ink)'};">${dis.absencesConsecutives}</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Sanctions / avertissements</span>
+          <span style="font-weight:700;color:${sanctions.length>0?'var(--amber)':'var(--green)'};">${sanctions.length}</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Cotisations dues (${year})</span>
+          <span style="font-weight:700;">${totalDue.toLocaleString()} FCFA</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);">
+          <span class="text-sm text-muted">Cotisations payées</span>
+          <span style="font-weight:700;color:var(--green);">${totalPaid.toLocaleString()} FCFA</span>
+        </div>
+        <div class="flex-between" style="padding:7px 0;">
+          <span class="text-sm text-muted">Reste à payer / solde</span>
+          <span style="font-weight:700;color:${soldePersonnel>0?'var(--red)':'var(--green)'};">${soldePersonnel>0?'+':''} ${soldePersonnel.toLocaleString()} FCFA</span>
+        </div>
+        ${dis.interdit ? `<div class="alert-banner danger mt-8"><div class="alert-banner__icon">⛔</div><div><b>Non autorisé à prester</b> — 2 absences consécutives aux répétitions</div></div>` : `<div class="alert-banner success mt-8"><div class="alert-banner__icon">✅</div><div>Autorisé à prester</div></div>`}
+      </div>` : ''}
+
+      <!-- ══ MES CLASSEMENTS ══ -->
+      ${classementsPublies ? `
+      <div class="section-title"><span class="ornament">🏆</span> Mes classements</div>
+      <div class="card">
+        ${clsGlobal ? `<div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);"><span class="text-sm text-muted">🏆 Rang global</span><span style="font-weight:700;color:var(--maroon);">${ClassementsModule.medal(clsGlobal.rang)} ${clsGlobal.rang}e · ${clsGlobal.score.toFixed(1)}/100</span></div>` : ''}
+        ${clsDiscipline ? `<div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);"><span class="text-sm text-muted">⚖️ Rang discipline</span><span style="font-weight:700;">${ClassementsModule.medal(clsDiscipline.rang)} ${clsDiscipline.rang}e · ${clsDiscipline.score.toFixed(1)}/100</span></div>` : ''}
+        ${clsTresorerie ? `<div class="flex-between" style="padding:7px 0;border-bottom:1px solid var(--line);"><span class="text-sm text-muted">💰 Rang trésorerie</span><span style="font-weight:700;">${ClassementsModule.medal(clsTresorerie.rang)} ${clsTresorerie.rang}e · ${clsTresorerie.score.toFixed(1)}/100</span></div>` : ''}
+        ${clsMusical ? `<div class="flex-between" style="padding:7px 0;"><span class="text-sm text-muted">🎵 Rang musical</span><span style="font-weight:700;">${ClassementsModule.medal(clsMusical.rang)} ${clsMusical.rang}e · ${clsMusical.score.toFixed(1)}/100</span></div>` : ''}
+        ${(!clsGlobal && !clsDiscipline && !clsTresorerie && !clsMusical) ? '<div class="text-sm text-muted center">Aucune donnée de classement disponible</div>' : ''}
+        <button class="btn secondary block mt-12" data-nav="classements">🏆 Voir le classement complet</button>
+      </div>` : `
+      <div class="section-title"><span class="ornament">🏆</span> Mes classements</div>
+      <div class="card center"><div class="text-sm text-muted">🔒 Les classements ne sont pas encore publiés</div></div>`}
+
+      <!-- ══ HISTORIQUE RÉCENT ══ -->
+      <div class="section-title"><span class="ornament">🕐</span> Historique récent</div>
+      <div class="card">
+        ${dernieresEvals.length ? `
+          <div style="font-weight:700;font-size:0.88rem;color:var(--maroon);margin-bottom:6px;">🎵 Dernières évaluations</div>
+          ${dernieresEvals.map(e => `
+            <div class="flex-between" style="padding:5px 0;border-bottom:1px solid var(--line);">
+              <span class="text-sm">${Utils.fmtDate(e.date)} — ${Utils.escapeHtml(e.type||'Évaluation')}</span>
+              <span style="font-weight:700;color:${Number(e.note)>=10?'var(--green)':'var(--red)'};">${e.note}/20</span>
+            </div>`).join('')}
+          <div class="text-sm text-muted mt-6">Moyenne : <b>${moyEvals||'—'}/20</b> sur ${evals.length} évaluation(s)</div>
+          <button class="btn secondary sm mt-8" id="btn-mes-evals">📋 Toutes mes évaluations</button>
+        ` : '<div class="text-sm text-muted">Aucune évaluation enregistrée</div>'}
+        ${dernieresSanctions.length ? `
+          <div style="font-weight:700;font-size:0.88rem;color:var(--amber);margin-top:14px;margin-bottom:6px;">⚖️ Dernières sanctions</div>
+          ${dernieresSanctions.map(s => `
+            <div class="flex-between" style="padding:5px 0;border-bottom:1px solid var(--line);">
+              <span class="text-sm">${Utils.fmtDate(s.date)} — ${Utils.escapeHtml(s.type||'Sanction')}</span>
+              <span class="pill danger" style="font-size:0.72rem;">${Utils.escapeHtml(s.niveau||'—')}</span>
+            </div>`).join('')}` : ''}
+        ${paiementsHist.length ? `
+          <div style="font-weight:700;font-size:0.88rem;color:var(--sage);margin-top:14px;margin-bottom:6px;">💰 Derniers paiements</div>
+          ${paiementsHist.map(p => `
+            <div class="flex-between" style="padding:5px 0;border-bottom:1px solid var(--line);">
+              <span class="text-sm">${Utils.fmtDate(p.date)} — ${Utils.escapeHtml(p.monthKey||'')}</span>
+              <span style="font-weight:700;color:var(--green);">+${Number(p.montant||0).toLocaleString()} FCFA</span>
+            </div>`).join('')}` : ''}
+      </div>
+
+      <!-- ══ DONNÉES DÉTAILLÉES ══ -->
+      <div class="section-title"><span class="ornament">🔍</span> Consulter mes données détaillées</div>
+      <div class="grid-2">
+        <button class="btn secondary block" id="btn-perso-discipline">⚖️ Discipline</button>
+        <button class="btn secondary block" id="btn-perso-tresorerie">💰 Trésorerie</button>
+        <button class="btn secondary block" id="btn-perso-direction" style="grid-column:1/-1;">🎵 Direction Technique</button>
+      </div>
+      ` : ''}
     `;
 
     // ── Événements ──
@@ -3645,14 +3797,14 @@ const DashboardModule = {
     const btnEvals = main.querySelector('#btn-mes-evals');
     if (btnEvals) btnEvals.addEventListener('click', () => this._choristeEvals(m, evals));
 
-    // Boutons espaces détaillés
+    // ── Données détaillées ──
     const btnDiscipline = main.querySelector('#btn-perso-discipline');
     if (btnDiscipline) btnDiscipline.addEventListener('click', () => this._choristeDetailDiscipline(m));
     const btnTresorerie = main.querySelector('#btn-perso-tresorerie');
     if (btnTresorerie) btnTresorerie.addEventListener('click', () => this._choristeDetailTresorerie(m, year));
     const btnDirection = main.querySelector('#btn-perso-direction');
     if (btnDirection) btnDirection.addEventListener('click', () => this._choristeDetailDirection(m, evals));
-  },
+  }, // fin _renderChoristeInner
 
   // ── D — Espace Discipline du choriste ──────────────────────────
   _choristeDetailDiscipline(m) {
@@ -10489,7 +10641,17 @@ function updateNotificationsBadge() {
 function setSyncStatus(status) {
   const label = document.getElementById('sync-label');
   if (!label) return;
-  label.textContent = status === 'error' ? '⚠️ Erreur d\'enregistrement' : '💾 Local';
+  const states = {
+    synced:      { icon: '☁️',  text: 'Synchronisé',   color: 'var(--green)' },
+    saving:      { icon: '⬆️',  text: 'Enregistrement…',color: 'var(--amber)' },
+    connecting:  { icon: '🔄',  text: 'Connexion…',    color: 'var(--amber)' },
+    uploading:   { icon: '⬆️',  text: 'Migration…',    color: 'var(--amber)' },
+    local:       { icon: '💾',  text: 'Local',         color: 'var(--ink-soft)' },
+    error:       { icon: '⚠️',  text: 'Erreur sync',   color: 'var(--red)' },
+  };
+  const s = states[status] || states.local;
+  label.textContent = `${s.icon} ${s.text}`;
+  label.style.color = s.color;
 }
 
 // ── PWA : invite d'installation (câblage de la bannière .install-banner) ──
@@ -10607,23 +10769,21 @@ document.addEventListener('DOMContentLoaded', () => {
   registerServiceWorker();
   setupInstallPrompt();
 
-  // Charge les données (localStorage, ou données de base au premier lancement)
-  Store.init();
+  // ── 1. Charger depuis localStorage immédiatement (affichage rapide) ──
+  Store.init(); // démarre aussi le listener Firestore en arrière-plan
 
-  // Profil déjà connecté ET session non expirée ? On démarre directement
-  // l'app. Sinon (pas de profil, ou plus de 15 min d'inactivité depuis la
-  // dernière utilisation), on revient à l'écran de connexion.
+  // ── 2. Restaurer le profil connecté ──────────────────────────────
   const savedProfile = LocalProfile.load();
 
   // Rétrocompatibilité : ancien profil Bureau avec bureauId individuel
-  // → on déduit le département depuis BUREAU_ACCOUNTS si le département
-  //   n'est pas encore stocké directement.
   if (savedProfile && savedProfile.role === 'bureau' && savedProfile.bureauId && !savedProfile.departement) {
     const acc = BUREAU_ACCOUNTS[savedProfile.bureauId];
     if (acc) savedProfile.departement = acc.departement;
   }
 
-  if (savedProfile && savedProfile.role && !SessionGuard.isExpired() && (savedProfile.role !== 'choriste' || savedProfile.choristeMembreId)) {
+  // ── 3. Lancer l'app (le onSnapshot mettra à jour l'UI en temps réel) ──
+  if (savedProfile && savedProfile.role && !SessionGuard.isExpired() &&
+      (savedProfile.role !== 'choriste' || savedProfile.choristeMembreId)) {
     Permissions.setProfile(savedProfile);
     startApp();
   } else {
