@@ -1,16 +1,12 @@
 // ════════════════════════════════════════════════════════════════
 // FIREBASE CONFIGURATION — SVS-EEI Chorale App
-// ════════════════════════════════════════════════════════════════
-//
-// Ce fichier contient la configuration Firebase du projet.
-// Ne jamais l'écraser lors des mises à jour de l'application principale.
-// Pour mettre à jour la config, modifier uniquement cet objet firebaseConfig.
-//
+// SDK Modulaire v10 (ES Modules)
 // ════════════════════════════════════════════════════════════════
 
-// SDK Firebase (compat — chargé via CDN dans index.html)
-// Compatible avec firebase-app-compat.js
+import { initializeApp }                             from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+import { getFirestore, enableIndexedDbPersistence }  from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
 
+// ── Configuration Firebase ───────────────────────────────────────
 const firebaseConfig = {
   apiKey:            "AIzaSyARm828relinxQ_1uoKebDHG1WOog4mRt0",
   authDomain:        "chorale-svs-app-web-v9-3.firebaseapp.com",
@@ -21,24 +17,29 @@ const firebaseConfig = {
   appId:             "1:497628233660:web:f45d82e23ca07ad609b5b9"
 };
 
-// Initialisation Firebase (uniquement si le SDK compat est chargé)
-(function () {
-  if (typeof firebase === 'undefined') {
-    // Mode local uniquement — l'app fonctionne sans Firebase.
-    console.info('[firebase-config] SDK Firebase non détecté — mode local uniquement.');
-    return;
-  }
+try {
+  const app = initializeApp(firebaseConfig);
+  const db  = getFirestore(app);
 
-  try {
-    if (!firebase.apps.length) {
-      firebase.initializeApp(firebaseConfig);
-      console.info('[firebase-config] Firebase initialisé avec succès.');
-    } else {
-      console.info('[firebase-config] Firebase déjà initialisé.');
+  // Persistence hors-ligne (fonctionne même sans réseau)
+  enableIndexedDbPersistence(db).catch(err => {
+    if (err.code === 'failed-precondition') {
+      console.warn('[Firebase] Persistence désactivée (plusieurs onglets ouverts).');
+    } else if (err.code === 'unimplemented') {
+      console.warn('[Firebase] Persistence non supportée par ce navigateur.');
     }
-    window.__firebaseApp__    = firebase.app();
-    window.__firebaseConfig__ = firebaseConfig;
-  } catch (err) {
-    console.error('[firebase-config] Erreur initialisation Firebase :', err);
-  }
-})();
+  });
+
+  // Exposer globalement AVANT l'événement
+  window.__firebase__ = { app, db };
+
+  // ✅ Signaler à index.html que Firebase est prêt
+  // (résout le problème de timing entre type="module" et DOMContentLoaded)
+  window.dispatchEvent(new CustomEvent('firebase-ready', { detail: { db } }));
+  console.info('[Firebase] Initialisé et prêt.');
+
+} catch (err) {
+  console.error('[Firebase] Erreur d\'initialisation :', err);
+  // Signaler l'échec pour que l'app bascule en mode local
+  window.dispatchEvent(new CustomEvent('firebase-error', { detail: { err } }));
+}
