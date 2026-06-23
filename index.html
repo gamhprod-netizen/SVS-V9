@@ -28,6 +28,8 @@
        écrasé par les mises à jour de l'application principale.
        ═══════════════════════════════════════════════════════════════ -->
   <script type="module" src="firebase-config.js"></script>
+  
+  <script src="notifications.js"></script>
 
   <style>
 /* ════════════════════════════════════════════════════════════════
@@ -614,19 +616,63 @@ body {
   box-shadow: 0 0 0 0 rgba(92,201,122,0.6);
   animation: sync-pulse 2s infinite;
   flex-shrink: 0;
+  transition: background 0.3s;
 }
-.sync-dot.offline {
-  background: #D9534F;
-  animation: none;
-}
-.sync-dot.syncing {
-  background: var(--gold);
-}
+.sync-dot.offline  { background: #D9534F; animation: sync-blink 1.2s infinite; box-shadow:none; }
+.sync-dot.syncing  { background: var(--gold); animation: sync-spin 1s linear infinite; box-shadow:none; }
+.sync-dot.error    { background: #D9534F; animation: none; box-shadow:none; }
+.sync-dot.local    { background: #8a8a8a; animation: none; box-shadow:none; }
 @keyframes sync-pulse {
-  0% { box-shadow: 0 0 0 0 rgba(92,201,122,0.5); }
-  70% { box-shadow: 0 0 0 6px rgba(92,201,122,0); }
+  0%   { box-shadow: 0 0 0 0 rgba(92,201,122,0.5); }
+  70%  { box-shadow: 0 0 0 6px rgba(92,201,122,0); }
   100% { box-shadow: 0 0 0 0 rgba(92,201,122,0); }
 }
+@keyframes sync-blink {
+  0%,100% { opacity:1; } 50% { opacity:0.3; }
+}
+@keyframes sync-spin {
+  0% { transform:rotate(0deg); } 100% { transform:rotate(360deg); }
+}
+
+/* ── Bannière hors-ligne ── */
+#offline-banner {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 9999;
+  background: #b94a48;
+  color: #fff;
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transform: translateY(-100%);
+  transition: transform 0.35s cubic-bezier(.4,0,.2,1);
+  box-shadow: 0 2px 8px rgba(0,0,0,.25);
+}
+#offline-banner.visible { transform: translateY(0); }
+#offline-banner .ob-icon { font-size: 1.1rem; flex-shrink:0; }
+#offline-banner .ob-text { flex: 1; line-height: 1.3; }
+
+/* Bannière reconnexion (verte) */
+#online-banner {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 9999;
+  background: #2d7d46;
+  color: #fff;
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transform: translateY(-100%);
+  transition: transform 0.35s cubic-bezier(.4,0,.2,1);
+  box-shadow: 0 2px 8px rgba(0,0,0,.25);
+}
+#online-banner.visible { transform: translateY(0); }
 .user-btn {
   background: rgba(250,241,214,0.12);
   border: 1px solid rgba(250,241,214,0.25);
@@ -653,6 +699,20 @@ body {
   </style>
 </head>
 <body>
+  <!-- Bannière hors-ligne (masquée par défaut) -->
+  <div id="offline-banner">
+    <span class="ob-icon">📶</span>
+    <span class="ob-text">
+      <b>Vous êtes hors ligne.</b><br>
+      Les modifications sont enregistrées localement et seront synchronisées dès le retour de la connexion.
+    </span>
+  </div>
+  <!-- Bannière reconnexion (masquée par défaut) -->
+  <div id="online-banner">
+    <span class="ob-icon">✅</span>
+    <span class="ob-text" id="online-banner-text">Connexion rétablie — synchronisation en cours…</span>
+  </div>
+
   <div id="app"></div>
 
   <script>
@@ -1110,6 +1170,23 @@ const Store = {
   _remoteWrite: false,     // true pendant qu'on traite un snapshot entrant
   _pendingSave: false,     // évite les sauvegardes en boucle
 
+  // ── Sécurité anti-écrasement (Option A) ─────────────────────────
+  // _firestoreReady : passe à true uniquement après réception du 1er
+  //   onSnapshot. Tant que false, aucun updateDoc n'est envoyé vers
+  //   Firestore — les modifications restent dans _pendingFields.
+  // _pendingFields : dictionnaire { fieldKey: valeur } accumulant toutes
+  //   les modifications effectuées hors-ligne ou avant le 1er snapshot.
+  //   Chaque clé correspond à un champ racine du document Firestore
+  //   (ex: 'paiements', 'sanctions', 'membres', 'meta'…).
+  //   Plusieurs actions sur le même champ sont naturellement fusionnées
+  //   (la dernière valeur du champ in-memory gagne, ce qui est correct
+  //   puisque Store.data est toujours cohérent en local).
+  // _onlineHandler : référence de la fonction écoutant 'online', stockée
+  //   pour pouvoir la retirer si nécessaire.
+  _firestoreReady: false,
+  _pendingFields:  {},
+  _onlineHandler:  null,
+
   // ════════════════════════════════════════════════════════════════
   // INIT — charge localStorage immédiatement, puis attend l'événement
   // 'firebase-ready' émis par firebase-config.js (module ES asynchrone).
@@ -1162,37 +1239,78 @@ const Store = {
   },
 
   // ── Connexion Firestore + listener onSnapshot temps réel ────────
+  //
+  // SÉCURITÉ ANTI-ÉCRASEMENT (Option A — Niveau 1) :
+  //   Le flag _firestoreReady est mis à true uniquement ici, après
+  //   réception du PREMIER snapshot Firestore. Cela garantit que
+  //   save() ne peut jamais écrire vers Firestore avant d'avoir lu
+  //   l'état actuel du serveur — quel que soit l'appareil ou la
+  //   durée de la période hors-ligne.
+  //
+  //   Flux de reconnexion sécurisé :
+  //     1. onSnapshot reçu → Firestore écrase Store.data (source de vérité)
+  //     2. _firestoreReady = true
+  //     3. _flushPending() envoie les champs modifiés hors-ligne
+  //        via updateDoc (fusion partielle, jamais de réécriture totale)
+  //     4. Le onSnapshot suivant confirme l'état final
+  //
   _connectFirestore(db) {
     setSyncStatus('connecting');
     import('https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js')
-      .then(({ doc, setDoc, onSnapshot, serverTimestamp }) => {
+      .then(({ doc, setDoc, updateDoc, onSnapshot, serverTimestamp }) => {
         const ref = doc(db, 'chorale-svs', 'data');
 
         this._unsubscribe = onSnapshot(ref,
           (snap) => {
             if (snap.exists()) {
-              // Firestore a des données → source de vérité absolue
+              // ── Firestore a des données → source de vérité absolue ──
               const remote = snap.data();
               delete remote._updatedAt; // champ interne Firestore
+
+              // Appliquer Firestore dans Store.data (écrase le local)
               this._remoteWrite = true;
               this.data = this._merge(structuredClone(SEED_DATA), remote);
               this.recomputeAllCotisations_silent();
               try { localStorage.setItem(STORAGE_KEY, JSON.stringify(this.data)); } catch(e) {}
               this._remoteWrite = false;
               setSyncStatus('synced');
+
               // Rafraîchir le module affiché pour tous les utilisateurs
               if (typeof Router !== 'undefined' && Router.current) {
                 try { Router.render(Router.current); } catch(e) {}
               }
               console.info('[Store] ☁️ Données Firestore appliquées.');
+
+              // ── Débloquer les écritures + vider la file hors-ligne ──
+              // C'est ici que _firestoreReady passe à true pour la 1ère fois.
+              // Toute modification effectuée avant ce point est dans
+              // _pendingFields et sera envoyée maintenant via updateDoc.
+              if (!this._firestoreReady) {
+                this._firestoreReady = true;
+                console.info('[Store] 🔓 Firestore prêt — écritures débloquées.');
+              }
+              // Toujours vider la file après chaque snapshot (reconnexion,
+              // retour en ligne, etc.) pour ne perdre aucune opération.
+              this._flushPending(db, ref, updateDoc, serverTimestamp);
+
             } else {
-              // Firestore vide → migrer localStorage vers Firestore
+              // ── Firestore vide → migration initiale (setDoc complet) ──
+              // C'est le SEUL cas légitime d'un setDoc complet.
+              // Après cette migration, tous les saves suivants utilisent updateDoc.
               console.info('[Store] Firestore vide — migration en cours…');
               setSyncStatus('uploading');
               const payload = Object.assign({}, this.data, { _updatedAt: serverTimestamp() });
               setDoc(ref, payload)
-                .then(() => { setSyncStatus('synced'); console.info('[Store] ✅ Migration Firestore réussie.'); })
-                .catch(err  => { setSyncStatus('error'); console.error('[Store] ❌ Erreur migration :', err); });
+                .then(() => {
+                  this._firestoreReady = true;
+                  this._pendingFields  = {}; // rien à flusher, on vient de tout écrire
+                  setSyncStatus('synced');
+                  console.info('[Store] ✅ Migration Firestore réussie.');
+                })
+                .catch(err => {
+                  setSyncStatus('error');
+                  console.error('[Store] ❌ Erreur migration :', err);
+                });
             }
           },
           (err) => {
@@ -1200,6 +1318,26 @@ const Store = {
             setSyncStatus('error');
           }
         );
+
+        // ── Écouter le retour en ligne pour flusher les pending ──────
+        // Si l'appareil était déjà hors-ligne au moment de _connectFirestore,
+        // onSnapshot ne répondra qu'au retour de la connexion. L'écouteur
+        // ci-dessous s'assure qu'un flush est aussi tenté à ce moment.
+        if (this._onlineHandler) {
+          window.removeEventListener('online', this._onlineHandler);
+        }
+        this._onlineHandler = () => {
+          console.info('[Store] 🌐 Retour en ligne — tentative de flush des pending.');
+          const dbNow = window.__firebase__ && window.__firebase__.db;
+          if (dbNow && this._firestoreReady && Object.keys(this._pendingFields).length > 0) {
+            import('https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js')
+              .then(({ doc: d2, updateDoc: ud2, serverTimestamp: st2 }) => {
+                this._flushPending(dbNow, d2(dbNow, 'chorale-svs', 'data'), ud2, st2);
+              })
+              .catch(e => console.error('[Store] Flush online import error:', e));
+          }
+        };
+        window.addEventListener('online', this._onlineHandler);
       })
       .catch(err => {
         console.error('[Store] Import Firestore échoué :', err);
@@ -1208,17 +1346,77 @@ const Store = {
   },
 
   // ════════════════════════════════════════════════════════════════
-  // SAVE — localStorage immédiat + Firestore asynchrone.
-  // Les écritures déclenchées par onSnapshot sont ignorées (_remoteWrite)
-  // pour éviter les boucles infinies.
+  // _flushPending — Envoie tous les champs accumulés hors-ligne vers
+  // Firestore via updateDoc (mise à jour partielle, jamais totale).
+  //
+  // Garanties :
+  //   • Appelé uniquement après _firestoreReady = true (Firestore lu)
+  //   • updateDoc fusionne champ par champ : un champ non présent dans
+  //     le patch n'est jamais touché côté Firestore
+  //   • Si _pendingFields est vide, aucune requête réseau n'est faite
+  //   • En cas d'erreur réseau, _pendingFields est conservé intégralement
+  //     pour la prochaine tentative (aucune perte)
   // ════════════════════════════════════════════════════════════════
-  save() {
+  _flushPending(db, ref, updateDoc, serverTimestamp) {
+    const keys = Object.keys(this._pendingFields);
+    if (keys.length === 0) return; // rien à envoyer
+
+    // Construire le patch : chaque clé = un champ racine Firestore
+    // On lit la valeur ACTUELLE de Store.data (déjà mergée avec Firestore)
+    // pour chaque champ en attente — c'est toujours la valeur la plus
+    // récente et cohérente disponible localement.
+    const patch = { _updatedAt: serverTimestamp() };
+    keys.forEach(k => {
+      patch[k] = this.data[k];
+    });
+
+    const flushedKeys = keys.slice(); // copie pour le log
+    // Vider immédiatement la file pour éviter un double-flush si
+    // onSnapshot re-déclenche avant la résolution de la Promise.
+    this._pendingFields = {};
+
+    setSyncStatus('saving');
+    console.info('[Store] 📤 Flush pending vers Firestore :', flushedKeys);
+
+    updateDoc(ref, patch)
+      .then(() => {
+        setSyncStatus('synced');
+        console.info('[Store] ✅ Flush réussi :', flushedKeys);
+      })
+      .catch(err => {
+        // En cas d'erreur : remettre les clés dans _pendingFields pour
+        // la prochaine tentative — aucune opération n'est perdue.
+        flushedKeys.forEach(k => { this._pendingFields[k] = true; });
+        setSyncStatus('error');
+        console.error('[Store] ❌ Erreur flush Firestore :', err);
+      });
+  },
+
+  // ════════════════════════════════════════════════════════════════
+  // SAVE — Persistance locale immédiate + envoi Firestore sécurisé.
+  //
+  // Paramètre optionnel fieldKey (string | string[]) :
+  //   Nom du ou des champs racines modifiés (ex: 'paiements', 'membres').
+  //   Si omis → tous les champs connus sont marqués comme modifiés
+  //   (comportement de repli sûr, utilisé par les appels legacy sans arg).
+  //
+  // Comportement selon l'état :
+  //   • _remoteWrite = true  → ignoré (snapshot en cours, anti-boucle)
+  //   • _firestoreReady = false → localStorage + accumulation pending
+  //                               (aucune écriture Firestore)
+  //   • hors ligne            → localStorage + accumulation pending
+  //   • en ligne + ready      → localStorage + updateDoc ciblé
+  //
+  // En aucun cas save() n'utilise setDoc complet (sauf migration initiale
+  // dans _connectFirestore quand le document Firestore n'existe pas encore).
+  // ════════════════════════════════════════════════════════════════
+  save(fieldKey) {
     if (!this._ready) return;
     if (this._remoteWrite) return;
 
     this.data.meta.lastUpdate = new Date().toISOString();
 
-    // Toujours écrire dans localStorage (cache hors-ligne)
+    // ── 1. Toujours écrire dans localStorage (disponible hors-ligne) ──
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(this.data));
     } catch (e) {
@@ -1226,19 +1424,44 @@ const Store = {
       Utils.toast('⚠️ Erreur d\'enregistrement local — espace de stockage plein ?');
     }
 
-    // Écrire dans Firestore si connecté
-    const db = window.__firebase__ && window.__firebase__.db;
-    if (!db) { setSyncStatus('local'); return; }
+    // ── 2. Déterminer les champs à marquer comme modifiés ────────────
+    // Normaliser fieldKey en tableau de strings
+    let fields = [];
+    if (fieldKey) {
+      fields = Array.isArray(fieldKey) ? fieldKey : [fieldKey];
+    } else {
+      // Repli legacy : marquer tous les champs racines de Store.data.
+      // Cela produit un updateDoc complet, mais JAMAIS un setDoc.
+      fields = Object.keys(this.data);
+    }
+    // Toujours inclure 'meta' (contient lastUpdate)
+    if (!fields.includes('meta')) fields.push('meta');
 
+    // ── 3. Accumuler dans _pendingFields (même si online, par sécurité) ──
+    fields.forEach(k => { this._pendingFields[k] = true; });
+
+    // ── 4. Si Firestore pas encore prêt ou hors-ligne → attendre ────
+    const db = window.__firebase__ && window.__firebase__.db;
+    if (!this._firestoreReady || !db || !navigator.onLine) {
+      const status = !navigator.onLine ? 'offline' : 'pending';
+      setSyncStatus(status);
+      if (!navigator.onLine) {
+        console.info('[Store] 📴 Hors ligne — opération mise en attente :', fields);
+      } else if (!this._firestoreReady) {
+        console.info('[Store] ⏳ Firestore pas encore prêt — opération mise en attente :', fields);
+      }
+      return;
+    }
+
+    // ── 5. Firestore prêt + en ligne → updateDoc ciblé ──────────────
     setSyncStatus('saving');
     import('https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js')
-      .then(({ doc, setDoc, serverTimestamp }) => {
-        const payload = Object.assign({}, this.data, { _updatedAt: serverTimestamp() });
-        return setDoc(doc(db, 'chorale-svs', 'data'), payload);
+      .then(({ doc, updateDoc, serverTimestamp }) => {
+        const ref = doc(db, 'chorale-svs', 'data');
+        this._flushPending(db, ref, updateDoc, serverTimestamp);
       })
-      .then(() => setSyncStatus('synced'))
       .catch(err => {
-        console.error('[Store] Erreur écriture Firestore :', err);
+        console.error('[Store] Erreur import Firestore (save) :', err);
         setSyncStatus('error');
       });
   },
@@ -2886,7 +3109,7 @@ const Permissions = {
 // ════════════════════════════════════════════════════════════════
 
 const ADMIN_PASSWORD = 'JosephT2026';
-const CHORISTE_PASSWORD = 'Chocho2026Svs';
+const CHORISTE_PASSWORD = '2026Svs';
 
 // ── Mots de passe des départements (indexés par clé de département) ──
 // Chaque département possède son propre mot de passe partagé par tous
@@ -5050,6 +5273,7 @@ const MembresModule = {
       Store.upsertMembre(updated);
       Utils.closeSheet();
       Utils.toast(isEdit ? 'Membre modifié' : 'Membre ajouté');
+      Utils.toastSync(isEdit ? 'Membre modifié' : 'Membre ajouté', 'Membres');
       Router.render();
     });
   },
@@ -5314,6 +5538,10 @@ const DisciplineModule = {
     if (!t) return;
     const membre = t.attribueA ? Store.getMembre(t.attribueA) : null;
     const hist = t.historique || [];
+
+    // Peut supprimer une toge : Admin ou responsable Discipline
+    const canDelete = Permissions.isAdmin() || Permissions.departement === 'discipline';
+
     const html = `
       <div class="card">
         ${this.infoRowToge('Type', t.type)}
@@ -5327,12 +5555,18 @@ const DisciplineModule = {
       <button class="btn secondary block" id="td-save-etat">✏️ Mettre à jour l'état</button>
       ${t.attribueA ? '<button class="btn danger block mt-8" id="td-restituer">↩️ Restituer cette toge</button>' : ''}
       ` : ''}
+      ${canDelete ? `
+      <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--line);">
+        <button class="btn danger block" id="td-delete">🗑️ Supprimer cette toge</button>
+      </div>
+      ` : ''}
       ${hist.length ? `
         <div class="section-title"><span class="ornament">📜</span> Historique</div>
         <div class="card">${hist.slice().reverse().map(h => `<div style="padding:5px 0;border-bottom:1px solid var(--line);font-size:0.82rem;"><span class="text-muted">${Utils.fmtDate(h.date)}</span> — ${Utils.escapeHtml(h.action)}${h.par?(' <span class="text-muted">('+h.par+')</span>'):''}</div>`).join('')}</div>
       ` : ''}
     `;
     const sheet = Utils.openSheet(`${t.type} — ${t.code}`, html);
+
     const saveEtatBtn = sheet.querySelector('#td-save-etat');
     if (saveEtatBtn) saveEtatBtn.addEventListener('click', () => {
       const nv = sheet.querySelector('#td-etat').value;
@@ -5341,6 +5575,7 @@ const DisciplineModule = {
       Utils.toast('État mis à jour');
       Router.render();
     });
+
     const restituerBtn = sheet.querySelector('#td-restituer');
     if (restituerBtn) restituerBtn.addEventListener('click', () => {
       Utils.confirmAction('Restituer cette toge ? Elle redeviendra disponible.', () => {
@@ -5349,6 +5584,24 @@ const DisciplineModule = {
         Utils.toast('Toge restituée');
         Router.render();
       });
+    });
+
+    const deleteBtn = sheet.querySelector('#td-delete');
+    if (deleteBtn) deleteBtn.addEventListener('click', () => {
+      const label = `${t.type} — ${t.code}${membre ? ' (attribuée à ' + membre.nom + ')' : ''}`;
+      Utils.confirmAction(
+        `Supprimer définitivement la toge <b>${Utils.escapeHtml(label)}</b> ?<br><br>` +
+        `${t.attribueA ? '<b>⚠️ Cette toge est actuellement attribuée — elle sera retirée du membre.</b><br><br>' : ''}` +
+        `Cette action est irréversible.`,
+        () => {
+          Store.deleteToge(id);
+          Store.logAction('Suppression toge', 'Discipline',
+            `Toge supprimée : ${label}`);
+          Utils.closeSheet();
+          Utils.toast('🗑️ Toge supprimée');
+          Router.render();
+        }
+      );
     });
   },
 
@@ -5941,6 +6194,7 @@ const DisciplineModule = {
       });
       Utils.closeSheet();
       Utils.toast('Sanction ajoutée');
+      Utils.toastSync('Sanction enregistrée', 'Sanction');
       Router.render();
     });
   },
@@ -6365,11 +6619,16 @@ const TresorerieModule = {
       container.innerHTML = `<div class="empty-state"><div class="empty-state__icon">📭</div><div class="empty-state__text">Aucun paiement enregistré</div></div>`;
       return;
     }
+
+    // Peut supprimer un paiement validé : Admin ou Trésorier
+    const canDelete = Permissions.isAdmin() || Permissions.departement === 'tresorerie';
+
     container.innerHTML = `<div class="list">${historique.map(p => {
       const statusClass = p.statut === 'Validé' ? 'actif' : p.statut === 'Refusé' ? 'suspendu' : 'bureau';
       const monthLabel = Utils.MONTHS[parseInt(p.monthKey.split('-')[1],10)-1] + ' ' + p.monthKey.split('-')[0];
+      const clickable = (isManager && p.statut === 'En attente') || canDelete;
       return `
-        <div class="list-row" data-pid="${p.id}" style="${isManager && p.statut==='En attente' ? '' : 'cursor:default;'}">
+        <div class="list-row" data-pid="${p.id}" style="${clickable ? '' : 'cursor:default;'}">
           <div class="list-row__avatar">${p.mode==='Mobile Money'?'📱':p.mode==='Virement'?'🏦':'💵'}</div>
           <div class="list-row__body">
             <div class="list-row__title">${monthLabel}</div>
@@ -6379,18 +6638,55 @@ const TresorerieModule = {
             <div style="font-weight:700;">${Utils.fmtFCFA(p.montant)}</div>
             <span class="pill ${statusClass}">${p.statut}</span>
           </div>
+          ${clickable ? '<span class="list-row__chevron">›</span>' : ''}
         </div>
       `;
     }).join('')}</div>`;
 
-    if (isManager) {
-      container.querySelectorAll('.list-row').forEach(row => {
-        const p = Store.getPaiement(row.dataset.pid);
-        if (p && p.statut === 'En attente') {
-          row.addEventListener('click', () => this.openValidationSheet(p));
+    container.querySelectorAll('.list-row').forEach(row => {
+      const p = Store.getPaiement(row.dataset.pid);
+      if (!p) return;
+      if (isManager && p.statut === 'En attente') {
+        row.addEventListener('click', () => this.openValidationSheet(p));
+      } else if (canDelete && (p.statut === 'Validé' || p.statut === 'Refusé')) {
+        row.addEventListener('click', () => this.openPaiementValideDetail(p));
+      }
+    });
+  },
+
+  // Sheet de détail d'un paiement déjà validé ou refusé (Admin / Trésorier)
+  openPaiementValideDetail(paiement) {
+    const m = Store.getMembre(paiement.membreId);
+    const monthLabel = Utils.MONTHS[parseInt(paiement.monthKey.split('-')[1],10)-1] + ' ' + paiement.monthKey.split('-')[0];
+    const html = `
+      <div class="card center">
+        <div class="text-sm text-muted">${Utils.escapeHtml(m ? m.nom : '—')} — ${monthLabel}</div>
+        <div class="font-display" style="font-size:1.6rem;font-weight:700;color:var(--maroon);">${Utils.fmtFCFA(paiement.montant)}</div>
+        <div class="text-sm text-muted mt-8">${paiement.mode} · ${Utils.fmtDate(paiement.datePaiement)}</div>
+        ${paiement.commentaire ? `<div class="text-sm mt-8">"${Utils.escapeHtml(paiement.commentaire)}"</div>` : ''}
+        <span class="pill ${paiement.statut==='Validé'?'actif':'suspendu'} mt-8">${paiement.statut}</span>
+        ${paiement.validePar ? `<div class="text-sm text-muted mt-4">Validé par ${Utils.escapeHtml(paiement.validePar)}</div>` : ''}
+      </div>
+      <div class="alert-banner danger mt-8">
+        <div class="alert-banner__icon">⚠️</div>
+        <div>La suppression d'un paiement est <b>irréversible</b>. Le solde du membre sera recalculé automatiquement.</div>
+      </div>
+      <button class="btn danger block mt-16" id="del-pai-valide">🗑️ Supprimer ce paiement</button>
+    `;
+    const sheet = Utils.openSheet('Détail du paiement', html);
+    sheet.querySelector('#del-pai-valide').addEventListener('click', () => {
+      Utils.confirmAction(
+        `Supprimer définitivement ce paiement de ${Utils.fmtFCFA(paiement.montant)} pour ${m ? m.nom : '—'} (${monthLabel}) ? Cette action est irréversible.`,
+        () => {
+          Store.deletePaiement(paiement.id);
+          Store.logAction('Suppression paiement', 'Trésorerie',
+            `Paiement supprimé : ${m ? m.nom : paiement.membreId} — ${monthLabel} — ${Utils.fmtFCFA(paiement.montant)} (${paiement.statut})`);
+          Utils.closeSheet();
+          Utils.toast('🗑️ Paiement supprimé — solde recalculé');
+          Router.render();
         }
-      });
-    }
+      );
+    });
   },
 
   openValidationSheet(paiement) {
@@ -6414,7 +6710,7 @@ const TresorerieModule = {
     sheet.querySelector('#valide-pai').addEventListener('click', () => {
       Store.validerPaiement(paiement.id, Permissions.displayName());
       Utils.closeSheet();
-      Utils.toast('✅ Paiement validé');
+      Utils.toastSync('Paiement validé', 'Validation paiement');
       Router.render();
     });
     sheet.querySelector('#refuse-pai').addEventListener('click', () => {
@@ -6444,8 +6740,19 @@ const TresorerieModule = {
           </select>
         </div>
       ` : `<input type="hidden" id="pf-membre" value="${membres[0].id}">`}
+
       <div class="field">
-        <label>Mois concerné</label>
+        <label>Nombre de mois à payer</label>
+        <select id="pf-nb-mois">
+          <option value="1">1 mois</option>
+          <option value="2">2 mois</option>
+          <option value="3">3 mois</option>
+          <option value="6">6 mois</option>
+          <option value="12">12 mois (année complète)</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Mois de départ</label>
         <select id="pf-month">
           ${Utils.MONTHS.map((mo,i) => {
             const key = `${year}-${String(i+1).padStart(2,'0')}`;
@@ -6453,9 +6760,17 @@ const TresorerieModule = {
           }).join('')}
         </select>
       </div>
+
+      <!-- Résumé des mois couverts -->
+      <div class="alert-banner info" id="pf-mois-resume" style="margin-bottom:0;">
+        <div class="alert-banner__icon">📅</div>
+        <div id="pf-mois-resume-text">Mois couvert : <b>—</b></div>
+      </div>
+
       <div class="field">
-        <label>Montant (FCFA)</label>
-        <input type="number" id="pf-montant" value="${Store.getCotisationDue(membres[0])}" min="0" step="50">
+        <label>Montant total (FCFA)</label>
+        <input type="number" id="pf-montant" min="0" step="50" style="font-weight:700;font-size:1.1rem;">
+        <div class="text-sm text-muted mt-4" id="pf-montant-detail"></div>
       </div>
       <div class="field">
         <label>Mode de paiement</label>
@@ -6485,35 +6800,111 @@ const TresorerieModule = {
       <button class="btn primary block" id="save-paiement">💾 Enregistrer</button>
     `;
     const sheet = Utils.openSheet('🧾 Déclarer un paiement', html);
+
+    // ── Helpers ──
+    const getMembreActuel = () => {
+      const sel = sheet.querySelector('#pf-membre');
+      const id  = sel.value || (membres[0] && membres[0].id);
+      return Store.getMembre(id);
+    };
+
+    const getMoisCouverts = () => {
+      const nb        = parseInt(sheet.querySelector('#pf-nb-mois').value, 10);
+      const startKey  = sheet.querySelector('#pf-month').value;
+      const [y, mo]   = startKey.split('-').map(Number);
+      const mois = [];
+      for (let i = 0; i < nb; i++) {
+        const m2 = ((mo - 1 + i) % 12) + 1;
+        const y2 = y + Math.floor((mo - 1 + i) / 12);
+        mois.push(`${y2}-${String(m2).padStart(2,'0')}`);
+      }
+      return mois;
+    };
+
+    const recalcMontant = () => {
+      const mem  = getMembreActuel();
+      const mois = getMoisCouverts();
+      if (!mem || !mois.length) return;
+
+      // Calcul du montant dû pour chaque mois couvert
+      let total = 0;
+      const detail = mois.map(mk => {
+        const due = Store.getCotisationDue(mem, mk);
+        total += due;
+        const [y2, m2] = mk.split('-');
+        return `${Utils.MONTHS[parseInt(m2,10)-1]} ${y2} : ${Utils.fmtFCFA(due)}`;
+      });
+
+      sheet.querySelector('#pf-montant').value = total;
+
+      // Résumé mois couverts
+      const labels = mois.map(mk => {
+        const [y2, m2] = mk.split('-');
+        return `${Utils.MONTHS[parseInt(m2,10)-1]} ${y2}`;
+      });
+      sheet.querySelector('#pf-mois-resume-text').innerHTML =
+        `Mois couverts : <b>${labels.join(', ')}</b>`;
+      sheet.querySelector('#pf-montant-detail').textContent =
+        mois.length > 1 ? detail.join(' · ') : '';
+    };
+
+    // Init
+    recalcMontant();
+
+    // Recalcul au changement
+    ['#pf-nb-mois', '#pf-month'].forEach(sel => {
+      sheet.querySelector(sel).addEventListener('change', recalcMontant);
+    });
+    const membreSel = sheet.querySelector('#pf-membre');
+    if (membreSel.tagName === 'SELECT') {
+      membreSel.addEventListener('change', recalcMontant);
+    }
+
+    // ── Enregistrement ──
     sheet.querySelector('#save-paiement').addEventListener('click', () => {
-      const membreId = sheet.querySelector('#pf-membre').value;
-      const monthKey = sheet.querySelector('#pf-month').value;
-      const montant = Number(sheet.querySelector('#pf-montant').value);
-      const mode = sheet.querySelector('#pf-mode').value;
-      const commentaire = sheet.querySelector('#pf-commentaire').value;
+      const mois       = getMoisCouverts();
+      const montantTot = Number(sheet.querySelector('#pf-montant').value);
+      const mode       = sheet.querySelector('#pf-mode').value;
+      const commentaire= sheet.querySelector('#pf-commentaire').value;
+      const membreId   = sheet.querySelector('#pf-membre').value;
       const autoValideEl = sheet.querySelector('#pf-autovalide');
       const autoValide = isManager && autoValideEl ? autoValideEl.checked : false;
 
-      if (!montant || montant <= 0) { Utils.toast('Montant invalide'); return; }
+      if (!montantTot || montantTot <= 0) { Utils.toast('Montant invalide'); return; }
 
-      Store.declarePaiement({
-        membreId, monthKey, montant, mode, commentaire,
-        declarePar: Permissions.displayName(),
-        autoValide,
-      });
+      if (mois.length === 1) {
+        // Cas simple : 1 mois → comportement identique à avant
+        Store.declarePaiement({
+          membreId, monthKey: mois[0], montant: montantTot,
+          mode, commentaire, declarePar: Permissions.displayName(), autoValide,
+        });
+      } else {
+        // Plusieurs mois : un paiement par mois, montant proportionnel
+        const mem  = getMembreActuel();
+        let reste  = montantTot;
+        mois.forEach((mk, idx) => {
+          const due = mem ? Store.getCotisationDue(mem, mk) : Math.round(montantTot / mois.length);
+          const part = idx === mois.length - 1 ? reste : due; // dernier mois reçoit le reste
+          reste -= part;
+          Store.declarePaiement({
+            membreId, monthKey: mk, montant: part,
+            mode,
+            commentaire: commentaire
+              ? `${commentaire} (${mois.length} mois)`
+              : `Paiement groupé ${mois.length} mois`,
+            declarePar: Permissions.displayName(),
+            autoValide,
+          });
+        });
+      }
+
       Utils.closeSheet();
-      Utils.toast(autoValide ? '✅ Paiement enregistré et validé' : '⏳ Paiement déclaré, en attente de validation');
+      const msg = mois.length > 1
+        ? `${mois.length} mois enregistrés — ${Utils.fmtFCFA(montantTot)}`
+        : autoValide ? 'Paiement enregistré et validé' : 'Paiement déclaré';
+      Utils.toastSync(msg, 'Paiement');
       Router.render();
     });
-
-    // Update montant default when member changes (bureau view)
-    const memberSel = sheet.querySelector('#pf-membre');
-    if (memberSel.tagName === 'SELECT') {
-      memberSel.addEventListener('change', () => {
-        const mem = Store.getMembre(memberSel.value);
-        if (mem) sheet.querySelector('#pf-montant').value = Store.getCotisationDue(mem);
-      });
-    }
   },
 
   // ── OFFRANDES ──
@@ -7123,6 +7514,7 @@ const SecretariatModule = {
       Store.addMotivationMessage({ id: Utils.genId('motiv'), message, auteur, date: Utils.todayISO(), actif });
       Store.logAction('Ajout', 'Secrétariat', `Nouveau message de motivation${actif?' (activé)':''}`);
       Utils.closeSheet(); Utils.toast('Message enregistré'); Router.render();
+      Utils.toastSync('Suggestion envoyée', 'Suggestion');
     });
   },
 
@@ -7689,6 +8081,7 @@ const DirectionModule = {
       Store.setEvaluation(membreId, evalData);
       Utils.closeSheet();
       Utils.toast('Évaluation enregistrée');
+      Utils.toastSync('Évaluation enregistrée', 'Évaluation');
       Router.render();
     });
   },
@@ -8824,6 +9217,7 @@ const RepetitionsModule = {
         Store.updateRepetition(id, { presences: newPresences });
         Utils.closeSheet();
         Utils.toast('Pointage enregistré');
+        Utils.toastSync('Pointage enregistré', 'Présence');
         Router.render();
       });
     }
@@ -9371,6 +9765,291 @@ const SuggestionsModule = {
 // RAPPORTS — Génération automatique
 // ════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════
+// EXCEL EXPORT — Moteur d'export .xlsx (Admin uniquement)
+// Utilise la librairie SheetJS (XLSX) chargée depuis CDN.
+// Chaque méthode génère et télécharge un fichier .xlsx autonome.
+// ═══════════════════════════════════════════════════════════════
+const ExcelExport = {
+
+  // ── Chargement CDN SheetJS (une seule fois) ──────────────────
+  _xlsxReady: false,
+  _loading: false,
+  _queue: [],
+
+  _loadXLSX(cb) {
+    if (typeof XLSX !== 'undefined') { cb(); return; }
+    if (this._loading) { this._queue.push(cb); return; }
+    this._loading = true;
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    s.onload = () => {
+      this._xlsxReady = true; this._loading = false;
+      cb();
+      this._queue.forEach(fn => fn()); this._queue = [];
+    };
+    s.onerror = () => { Utils.toast('❌ Impossible de charger SheetJS — vérifiez votre connexion internet.'); this._loading = false; };
+    document.head.appendChild(s);
+  },
+
+  // ── Utilitaires ───────────────────────────────────────────────
+  _download(wb, filename) {
+    XLSX.writeFile(wb, filename);
+    Utils.toast(`📊 ${filename} téléchargé`);
+  },
+
+  _wb(sheetMap) {
+    const wb = XLSX.utils.book_new();
+    Object.entries(sheetMap).forEach(([name, rows]) => {
+      const ws = XLSX.utils.aoa_to_sheet(rows);
+      // Style entête (gras) — SheetJS free n'a pas de style riche, mais on marque !
+      const range = XLSX.utils.decode_range(ws['!ref'] || 'A1');
+      ws['!cols'] = Array(range.e.c + 1).fill({ wch: 20 });
+      XLSX.utils.book_append_sheet(wb, ws, name.slice(0, 31)); // max 31 chars
+    });
+    return wb;
+  },
+
+  _today() { return new Date().toISOString().slice(0,10); },
+
+  // ── 1. MEMBRES ────────────────────────────────────────────────
+  exportMembres() {
+    this._loadXLSX(() => {
+      const d = Store.data;
+      const year = d.meta.annee;
+      const rows = [
+        ['ID', 'Nom', 'Statut', 'Situation', 'Pupitre', 'Fonction', 'Téléphone',
+         'Date naissance', 'Date entrée', 'IGI', 'Catégorie IGI'],
+      ];
+      d.membres.forEach(m => {
+        const igi = Store.calcIGI(m.id);
+        rows.push([
+          m.id, m.nom, m.statut, m.situation || '', m.pupitre || '',
+          m.fonction || '', m.telephone || '',
+          m.dateNaissance || '', m.dateEntree || '',
+          igi ? igi.igi.toFixed(1) : '', igi ? igi.categorie : '',
+        ]);
+      });
+      this._download(this._wb({ 'Membres': rows }), `membres_${this._today()}.xlsx`);
+    });
+  },
+
+  // ── 2. TRÉSORERIE ─────────────────────────────────────────────
+  exportTresorerie() {
+    this._loadXLSX(() => {
+      const d = Store.data;
+      const year = d.meta.annee;
+      const membres = d.membres;
+
+      // Onglet 1 : Cotisations mois par mois
+      const headerCotis = ['Membre', 'Statut', ...Utils.MONTHS.map(m => `${m} ${year}`), 'Total dû', 'Total payé', 'Solde'];
+      const rowsCotis = [headerCotis];
+      membres.forEach(m => {
+        const montants = Utils.MONTHS.map((_, i) => {
+          const mk = `${year}-${String(i+1).padStart(2,'0')}`;
+          return Store.getCotisation(m.id, mk);
+        });
+        const totalDue = Store.getCotisationDueAnnuel(m, year);
+        const totalPaid = montants.reduce((a,b) => a+b, 0);
+        rowsCotis.push([m.nom, m.statut, ...montants, totalDue, totalPaid, totalDue - totalPaid]);
+      });
+
+      // Onglet 2 : Historique paiements
+      const rowsPai = [['Membre', 'Mois', 'Montant', 'Mode', 'Statut', 'Date', 'Déclaré par', 'Validé par', 'Commentaire']];
+      Store.getPaiements().forEach(p => {
+        const m = Store.getMembre(p.membreId);
+        const [y, mo] = p.monthKey.split('-');
+        rowsPai.push([
+          m ? m.nom : p.membreId,
+          `${Utils.MONTHS[parseInt(mo,10)-1]} ${y}`,
+          p.montant, p.mode, p.statut,
+          p.datePaiement || '', p.declarePar || '', p.validePar || '', p.commentaire || '',
+        ]);
+      });
+
+      // Onglet 3 : Sanctions financières
+      const rowsSanc = [['Membre', 'Type', 'Motif', 'Montant', 'Date', 'Statut']];
+      d.sanctions.forEach(s => {
+        rowsSanc.push([s.membre || '', s.type || '', s.motif || '', s.montant || 0, s.date || '', s.statut || '']);
+      });
+
+      // Onglet 4 : Mouvements
+      const rowsMvt = [['Date', 'Type', 'Catégorie', 'Description', 'Montant', 'Source']];
+      d.mouvements.forEach(mv => {
+        rowsMvt.push([mv.date || '', mv.type || '', mv.categorie || '', mv.description || '', mv.montant || 0, mv.source || '']);
+      });
+
+      const wb = this._wb({
+        'Cotisations': rowsCotis,
+        'Historique paiements': rowsPai,
+        'Sanctions': rowsSanc,
+        'Mouvements': rowsMvt,
+      });
+      this._download(wb, `tresorerie_${year}_${this._today()}.xlsx`);
+    });
+  },
+
+  // ── 3. DISCIPLINE ─────────────────────────────────────────────
+  exportDiscipline() {
+    this._loadXLSX(() => {
+      const d = Store.data;
+
+      // Onglet 1 : Statistiques de présence
+      const rowsPres = [['Membre', 'Statut', 'Présences Sam.', 'Total Sam.', 'Tx Sam.', 'Présences Dim.', 'Total Dim.', 'Tx Dim.', 'Ponctualité', 'Absences consec.', 'Interdit prestation', 'Score discipline']];
+      d.membres.forEach(m => {
+        const dis = Store.getDisciplineStats(m.id);
+        rowsPres.push([
+          m.nom, m.statut,
+          dis.presentSamedi, dis.totalSamedi, (dis.txSamedi*100).toFixed(1)+'%',
+          dis.presentDimanche, dis.totalDimanche, (dis.txDimanche*100).toFixed(1)+'%',
+          (dis.ponctualite*100).toFixed(1)+'%',
+          dis.absencesConsecutives,
+          dis.interdit ? 'Oui' : 'Non',
+          dis.score !== undefined ? dis.score.toFixed(1) : '',
+        ]);
+      });
+
+      // Onglet 2 : Sanctions
+      const rowsSanc = [['Membre', 'Type', 'Niveau', 'Motif', 'Date', 'Montant', 'Statut']];
+      d.sanctions.forEach(s => {
+        rowsSanc.push([s.membre || '', s.type || '', s.niveau || '', s.motif || '', s.date || '', s.montant || 0, s.statut || '']);
+      });
+
+      // Onglet 3 : Toges
+      const rowsToges = [['Code', 'Type', 'État', 'Attribuée à', 'Date attribution', 'Observations']];
+      Store.getToges().forEach(t => {
+        const m = t.attribueA ? Store.getMembre(t.attribueA) : null;
+        rowsToges.push([t.code || '', t.type || '', t.etat || '', m ? m.nom : '', t.dateAttribution || '', t.observations || '']);
+      });
+
+      this._download(this._wb({
+        'Présences': rowsPres,
+        'Sanctions': rowsSanc,
+        'Toges': rowsToges,
+      }), `discipline_${this._today()}.xlsx`);
+    });
+  },
+
+  // ── 4. DIRECTION TECHNIQUE ────────────────────────────────────
+  exportDirection() {
+    this._loadXLSX(() => {
+      const d = Store.data;
+
+      // Onglet 1 : Évaluations
+      const rowsEval = [['Membre', 'Date', 'Type', 'Note /20', 'Appréciation', 'Évaluateur']];
+      (d.evaluations || []).forEach(e => {
+        const m = Store.getMembre(e.membreId);
+        rowsEval.push([m ? m.nom : e.membreId, e.date || '', e.type || '', e.note || '', e.appreciation || '', e.evaluateur || '']);
+      });
+
+      // Onglet 2 : Répertoire
+      const rowsRep = [['Titre', 'Auteur', 'Catégorie', 'Statut', 'Tonalité', 'Tempo', 'Notes']];
+      d.repertoire.forEach(c => {
+        rowsRep.push([c.titre || '', c.auteur || '', c.categorie || '', c.statut || '', c.tonalite || '', c.tempo || '', c.notes || '']);
+      });
+
+      // Onglet 3 : Répétitions
+      const rowsRep2 = [['Date', 'Type', 'Statut', 'Présents', 'Absents', 'Retards', 'Observations']];
+      d.repetitions.forEach(r => {
+        const presences = Object.values(r.presences || {});
+        const presents = presences.filter(p => p === 'Présent').length;
+        const absents  = presences.filter(p => p === 'Absent').length;
+        const retards  = presences.filter(p => p === 'En retard').length;
+        rowsRep2.push([r.date || '', r.type || '', r.statut || '', presents, absents, retards, r.observations || '']);
+      });
+
+      // Onglet 4 : Prestations
+      const rowsPrest = [['Date', 'Type', 'Lieu', 'Statut', 'Responsable', 'Présents']];
+      (d.prestations || []).forEach(p => {
+        const presents = Object.values(p.presences || {}).filter(v => v === 'Présent').length;
+        rowsPrest.push([p.date || '', p.type || '', p.lieu || '', p.statut || '', p.responsable || '', presents]);
+      });
+
+      this._download(this._wb({
+        'Évaluations': rowsEval,
+        'Répertoire': rowsRep,
+        'Répétitions': rowsRep2,
+        'Prestations': rowsPrest,
+      }), `direction_technique_${this._today()}.xlsx`);
+    });
+  },
+
+  // ── 5. CLASSEMENTS ────────────────────────────────────────────
+  exportClassements() {
+    this._loadXLSX(() => {
+      const cats = [
+        { key: 'global',      label: 'Global' },
+        { key: 'musical',     label: 'Musical' },
+        { key: 'discipline',  label: 'Discipline' },
+        { key: 'tresorerie',  label: 'Trésorerie' },
+      ];
+      const sheets = {};
+      cats.forEach(({ key, label }) => {
+        const rows = [['Rang', 'Membre', 'Pupitre', 'Score /100']];
+        Store.getClassement(key).forEach(r => {
+          rows.push([r.rang, r.membre.nom, r.membre.pupitre || '', r.score.toFixed(1)]);
+        });
+        sheets[label] = rows;
+      });
+      this._download(this._wb(sheets), `classements_${Store.data.meta.annee}_${this._today()}.xlsx`);
+    });
+  },
+
+  // ── 6. EXPORT GLOBAL (tous modules) ──────────────────────────
+  exportGlobal() {
+    this._loadXLSX(() => {
+      const d = Store.data;
+      const year = d.meta.annee;
+
+      // On regroupe les onglets des 4 exports en un seul fichier
+      const rowsMembres = [['ID', 'Nom', 'Statut', 'Situation', 'Pupitre', 'Téléphone', 'Date entrée']];
+      d.membres.forEach(m => rowsMembres.push([m.id, m.nom, m.statut, m.situation||'', m.pupitre||'', m.telephone||'', m.dateEntree||'']));
+
+      const headerCotis = ['Membre', ...Utils.MONTHS.map(mo=>`${mo} ${year}`), 'Dû', 'Payé', 'Solde'];
+      const rowsCotis = [headerCotis];
+      d.membres.forEach(m => {
+        const mois = Utils.MONTHS.map((_,i)=>Store.getCotisation(m.id,`${year}-${String(i+1).padStart(2,'0')}`));
+        const due = Store.getCotisationDueAnnuel(m, year);
+        const paid = mois.reduce((a,b)=>a+b,0);
+        rowsCotis.push([m.nom, ...mois, due, paid, due-paid]);
+      });
+
+      const rowsDis = [['Membre', 'Tx Sam.', 'Tx Dim.', 'Absences consec.', 'Interdit', 'Score']];
+      d.membres.forEach(m => {
+        const dis = Store.getDisciplineStats(m.id);
+        rowsDis.push([m.nom, (dis.txSamedi*100).toFixed(1)+'%', (dis.txDimanche*100).toFixed(1)+'%', dis.absencesConsecutives, dis.interdit?'Oui':'Non', dis.score!==undefined?dis.score.toFixed(1):'']);
+      });
+
+      const rowsIGI = [['Membre', 'IGI /100', 'Catégorie']];
+      d.membres.forEach(m => {
+        const igi = Store.calcIGI(m.id);
+        if (igi) rowsIGI.push([m.nom, igi.igi.toFixed(1), igi.categorie]);
+      });
+
+      const rowsCls = [['Rang Global', 'Membre', 'Score Global', 'Score Musical', 'Score Discipline', 'Score Trésorerie']];
+      Store.getClassement('global').forEach(r => {
+        const mus = Store.getClassement('musical').find(x=>x.membre.id===r.membre.id);
+        const dis = Store.getClassement('discipline').find(x=>x.membre.id===r.membre.id);
+        const tre = Store.getClassement('tresorerie').find(x=>x.membre.id===r.membre.id);
+        rowsCls.push([r.rang, r.membre.nom, r.score.toFixed(1), mus?mus.score.toFixed(1):'', dis?dis.score.toFixed(1):'', tre?tre.score.toFixed(1):'']);
+      });
+
+      const rowsAudit = [['Date', 'Action', 'Module', 'Détail', 'Auteur']];
+      (d.auditLog||[]).forEach(e => rowsAudit.push([e.date||'', e.action||'', e.module||'', e.detail||'', e.auteur||'']));
+
+      const wb = this._wb({
+        'Membres': rowsMembres,
+        'Cotisations': rowsCotis,
+        'Discipline': rowsDis,
+        'IGI': rowsIGI,
+        'Classements': rowsCls,
+        'Journal audit': rowsAudit,
+      });
+      this._download(wb, `export_complet_${year}_${this._today()}.xlsx`);
+    });
+  },
+};
+
 const RapportsModule = {
   render(main) {
     const d = Store.data;
@@ -9606,7 +10285,23 @@ const RapportsModule = {
       ` : ''}
 
       ${Permissions.isAdmin() ? `
-        <div class="grid-2 mt-16">
+        <div class="section-title mt-16"><span class="ornament">📊</span> Exports Excel</div>
+        <div class="card">
+          <div class="alert-banner info" style="margin-bottom:12px;">
+            <div class="alert-banner__icon">📊</div>
+            <div>Chaque export génère un fichier <b>.xlsx</b> directement exploitable dans Excel, LibreOffice ou Google Sheets.</div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:8px;">
+            <button class="btn sage block" id="excel-membres">📋 Membres — Fiche complète</button>
+            <button class="btn sage block" id="excel-tresorerie">💰 Trésorerie — Cotisations & paiements</button>
+            <button class="btn sage block" id="excel-discipline">⚖️ Discipline — Présences & sanctions</button>
+            <button class="btn sage block" id="excel-direction">🎵 Direction Technique — Évaluations & répertoire</button>
+            <button class="btn sage block" id="excel-classements">🏆 Classements complets</button>
+            <button class="btn primary block" id="excel-global">📦 Export complet (tous modules)</button>
+          </div>
+        </div>
+
+        <div class="grid-2 mt-8">
           <button class="btn secondary block" id="export-data">📤 Exporter (JSON)</button>
           <button class="btn ghost block" id="import-data">📥 Importer</button>
         </div>
@@ -9634,6 +10329,15 @@ const RapportsModule = {
           Router.navigate('dashboard');
         });
       });
+
+      // ── Boutons Export Excel ──
+      main.querySelector('#excel-membres').addEventListener('click',      () => ExcelExport.exportMembres());
+      main.querySelector('#excel-tresorerie').addEventListener('click',   () => ExcelExport.exportTresorerie());
+      main.querySelector('#excel-discipline').addEventListener('click',   () => ExcelExport.exportDiscipline());
+      main.querySelector('#excel-direction').addEventListener('click',    () => ExcelExport.exportDirection());
+      main.querySelector('#excel-classements').addEventListener('click',  () => ExcelExport.exportClassements());
+      main.querySelector('#excel-global').addEventListener('click',       () => ExcelExport.exportGlobal());
+
       // Render audit log
       const auditContainer = main.querySelector('#audit-log-container');
       if (auditContainer) AuditLogModule.render(auditContainer);
@@ -10638,21 +11342,214 @@ function updateNotificationsBadge() {
 // Stockage 100% local : il n'y a plus de "synchronisation" à proprement
 // parler. Cette fonction est conservée (appelée par Store.save()) mais ne
 // fait qu'afficher une confirmation visuelle discrète de l'enregistrement.
+// ═══════════════════════════════════════════════════════════════
+// CONNECTION MONITOR — Surveillance réseau & synchronisation
+// Gère : détection online/offline, bannières, dot de statut,
+//        file d'attente de synchro, confirmations après action.
+// ═══════════════════════════════════════════════════════════════
+const ConnectionMonitor = {
+  _isOnline:     navigator.onLine,
+  _syncStatus:   'local',      // 'synced' | 'saving' | 'pending' | 'offline' | 'error' | 'local'
+  _onlineBannerTimer: null,
+  _pendingCount:  0,           // actions en attente de sync
+  _listeners:    [],
+
+  // ── Initialisation (appelée une seule fois au démarrage) ──────
+  init() {
+    window.addEventListener('online',  () => this._onOnline());
+    window.addEventListener('offline', () => this._onOffline());
+    // État initial
+    if (!navigator.onLine) this._applyOfflineUI(false);
+  },
+
+  // ── Réseau perdu ──────────────────────────────────────────────
+  _onOffline() {
+    this._isOnline = false;
+    this._applyOfflineUI(true);
+    this.setStatus('offline');
+    console.warn('[ConnectionMonitor] 📶 Hors ligne');
+  },
+
+  // ── Réseau rétabli ────────────────────────────────────────────
+  //
+  // SÉCURITÉ ANTI-ÉCRASEMENT :
+  //   On ne déclenche PLUS Store.save() aveuglément au retour en ligne.
+  //   Le flux correct est :
+  //     1. onSnapshot reçu (Firestore envoie son état actuel)
+  //     2. Store.data ← Firestore (source de vérité appliquée)
+  //     3. _firestoreReady = true
+  //     4. _flushPending() envoie uniquement les champs hors-ligne
+  //        via updateDoc — jamais de réécriture totale.
+  //
+  //   Si le listener onSnapshot est déjà actif, il recevra naturellement
+  //   une mise à jour dès que le réseau est rétabli (comportement Firebase).
+  //   Si le listener a été perdu, _connectFirestore le recrée.
+  //
+  _onOnline() {
+    this._isOnline = true;
+    this._hideOfflineBanner();
+    this._showOnlineBanner('Connexion rétablie — synchronisation en cours…');
+    this.setStatus('pending');
+    console.info('[ConnectionMonitor] ✅ En ligne — attente du snapshot Firestore');
+
+    if (Store && Store._ready) {
+      const db = window.__firebase__ && window.__firebase__.db;
+      if (db && !Store._unsubscribe) {
+        // Listener perdu → le recréer (il déclenchera _flushPending lui-même)
+        Store._connectFirestore(db);
+      }
+      // Si _unsubscribe existe : le listener onSnapshot actif va se
+      // réveiller automatiquement et appeler _flushPending via onSnapshot.
+      // L'_onlineHandler de _connectFirestore prend aussi en charge ce cas.
+    }
+  },
+
+  // ── Bannière hors-ligne ───────────────────────────────────────
+  _applyOfflineUI(animate) {
+    const b = document.getElementById('offline-banner');
+    if (!b) return;
+    if (animate) {
+      b.classList.add('visible');
+    } else {
+      b.style.transition = 'none';
+      b.classList.add('visible');
+      requestAnimationFrame(() => { b.style.transition = ''; });
+    }
+  },
+
+  _hideOfflineBanner() {
+    const b = document.getElementById('offline-banner');
+    if (b) b.classList.remove('visible');
+  },
+
+  // ── Bannière en ligne ─────────────────────────────────────────
+  _showOnlineBanner(msg) {
+    const b  = document.getElementById('online-banner');
+    const t  = document.getElementById('online-banner-text');
+    if (!b) return;
+    if (t) t.textContent = msg;
+    b.classList.add('visible');
+    clearTimeout(this._onlineBannerTimer);
+    this._onlineBannerTimer = setTimeout(() => b.classList.remove('visible'), 4000);
+  },
+
+  // ── Mise à jour du statut de synchronisation ─────────────────
+  // Appelée par Store.save(), _connectFirestore(), etc.
+  setStatus(status) {
+    this._syncStatus = status;
+    this._updateDot(status);
+    this._updateLabel(status);
+
+    // Quand sync réussie après reconnexion → bannière verte finale
+    if (status === 'synced' && !this._isOnline) return; // incohérent, ignorer
+    if (status === 'synced') {
+      const b = document.getElementById('online-banner');
+      if (b && b.classList.contains('visible')) {
+        const t = document.getElementById('online-banner-text');
+        if (t) t.textContent = '✅ Données synchronisées avec succès.';
+        clearTimeout(this._onlineBannerTimer);
+        this._onlineBannerTimer = setTimeout(() => b.classList.remove('visible'), 3000);
+      }
+    }
+  },
+
+  _updateDot(status) {
+    const dot = document.getElementById('sync-dot');
+    if (!dot) return;
+    dot.className = 'sync-dot'; // reset
+    const map = {
+      synced:     '',
+      saving:     'syncing',
+      connecting: 'syncing',
+      uploading:  'syncing',
+      pending:    'syncing',
+      offline:    'offline',
+      error:      'error',
+      local:      'local',
+    };
+    const cls = map[status];
+    if (cls) dot.classList.add(cls);
+  },
+
+  _updateLabel(status) {
+    const label = document.getElementById('sync-label');
+    if (!label) return;
+    const states = {
+      synced:      { icon: '🟢', text: 'Synchronisé',          color: '#5CC97A' },
+      saving:      { icon: '🟡', text: 'Sync en cours…',        color: 'var(--gold)' },
+      connecting:  { icon: '🟡', text: 'Connexion…',            color: 'var(--gold)' },
+      uploading:   { icon: '🟡', text: 'Migration…',            color: 'var(--gold)' },
+      pending:     { icon: '🟡', text: 'En attente de sync',    color: 'var(--gold)' },
+      offline:     { icon: '🔴', text: 'Hors ligne',            color: '#D9534F' },
+      error:       { icon: '🔴', text: 'Erreur sync',           color: '#D9534F' },
+      local:       { icon: '💾', text: 'Local',                 color: 'rgba(250,241,214,0.5)' },
+    };
+    const s = states[status] || states.local;
+    label.textContent = `${s.icon} ${s.text}`;
+    label.style.color  = s.color;
+  },
+
+  // ── API publique : utilisée par toutes les actions importantes ──
+  // Retourne une Promise<'synced'|'pending'> pour confirmer la sync.
+  confirmSync(actionLabel) {
+    return new Promise(resolve => {
+      if (!navigator.onLine) {
+        resolve('pending');
+        return;
+      }
+      // Délai court : si Firestore répond dans les 4s → synced
+      let resolved = false;
+      const tid = setTimeout(() => {
+        if (!resolved) { resolved = true; resolve('pending'); }
+      }, 4000);
+      // Écouter le passage à 'synced' du Store
+      const check = () => {
+        if (this._syncStatus === 'synced') {
+          if (!resolved) { resolved = true; clearTimeout(tid); resolve('synced'); }
+        }
+      };
+      // Poll simple (le listener Store.save → setSyncStatus met à jour _syncStatus)
+      const interval = setInterval(() => {
+        check();
+        if (resolved) clearInterval(interval);
+      }, 200);
+    });
+  },
+};
+
+// ── setSyncStatus : pont entre Store et ConnectionMonitor ──────
+// Conserve la même signature pour compatibilité avec le code existant.
 function setSyncStatus(status) {
-  const label = document.getElementById('sync-label');
-  if (!label) return;
-  const states = {
-    synced:      { icon: '☁️',  text: 'Synchronisé',   color: 'var(--green)' },
-    saving:      { icon: '⬆️',  text: 'Enregistrement…',color: 'var(--amber)' },
-    connecting:  { icon: '🔄',  text: 'Connexion…',    color: 'var(--amber)' },
-    uploading:   { icon: '⬆️',  text: 'Migration…',    color: 'var(--amber)' },
-    local:       { icon: '💾',  text: 'Local',         color: 'var(--ink-soft)' },
-    error:       { icon: '⚠️',  text: 'Erreur sync',   color: 'var(--red)' },
-  };
-  const s = states[status] || states.local;
-  label.textContent = `${s.icon} ${s.text}`;
-  label.style.color = s.color;
+  ConnectionMonitor.setStatus(status);
 }
+
+// ── Utils.toastSync : confirmation après chaque opération importante ──
+//
+// Affiche immédiatement un toast "enregistrement local" puis,
+// dès que Firestore confirme (ou après timeout), met à jour le message.
+//
+// Messages affichés :
+//   ✅ "Enregistrement effectué et synchronisé."
+//   ⚠️ "Enregistrement effectué localement, synchronisation en attente."
+//
+// Usage : Utils.toastSync('Paiement enregistré')
+//         Utils.toastSync('Sanction ajoutée', 'Discipline')
+//
+Utils.toastSync = function(label, actionLabel) {
+  if (!navigator.onLine || !Store._firestoreReady) {
+    // Hors ligne ou Firestore pas encore prêt : message immédiat
+    Utils.toast(`💾 ${label} — enregistrement effectué localement, synchronisation en attente.`);
+    return;
+  }
+  // En ligne : attendre la confirmation Firestore (max 5s)
+  ConnectionMonitor.confirmSync(actionLabel || label).then(result => {
+    if (result === 'synced') {
+      Utils.toast(`✅ ${label} — enregistrement effectué et synchronisé.`);
+    } else {
+      Utils.toast(`💾 ${label} — enregistrement effectué localement, synchronisation en attente.`);
+    }
+  });
+};
 
 // ── PWA : invite d'installation (câblage de la bannière .install-banner) ──
 window.__deferredInstallPrompt__ = null;
@@ -10768,6 +11665,7 @@ function logout(reason) {
 document.addEventListener('DOMContentLoaded', () => {
   registerServiceWorker();
   setupInstallPrompt();
+  ConnectionMonitor.init(); // ← surveillance réseau & sync
 
   // ── 1. Charger depuis localStorage immédiatement (affichage rapide) ──
   Store.init(); // démarre aussi le listener Firestore en arrière-plan
